@@ -164,7 +164,7 @@ function Show-UpdateNotification {
     )
     
     # Create notification message
-    $message = "Dear user, we have identified that there are pending updates for the following:`n`n"
+    $message = "We have found critical vulnerabilities on your system due to the following outdated browsers:`n`n"
     
     if ($PendingUpdates -contains "Chrome") {
         $message += "- Google Chrome`n"
@@ -176,101 +176,77 @@ function Show-UpdateNotification {
         $message += "- Microsoft Edge`n"
     }
     
-    $message += "`nPlease restart your browsers to ensure that these updates are installed for security reasons.`n"
-    $message += "Your browser may automatically restart itself if you do not manually do so."
+    $message += "`nYou are advised to launch each of these browsers and apply the updates. If a browser is already open, please close the browser completely and reload it."
     
     # Check if running as SYSTEM
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $isSystem = $currentUser.User.Value -eq "S-1-5-18"
     
     if ($isSystem) {
-        # Running as SYSTEM - use multiple methods to ensure notification reaches user
+        # Running as SYSTEM - use msg.exe to notify active user session
         Write-LogEntry "Running as SYSTEM - attempting user notification" "Information"
         
-        # Method 1: Use msg.exe to send message to all active console sessions
         try {
+            # Get active user sessions
             $queryResults = query user 2>$null
             if ($queryResults) {
-                Write-LogEntry "Query user results: $($queryResults -join '; ')" "Information"
+                Write-LogEntry "Query user results found" "Information"
                 
-                # Parse each line to find active console sessions
+                # Parse each line to find active sessions
                 $queryResults | Select-Object -Skip 1 | ForEach-Object {
                     $line = $_
-                    # Look for console or active sessions
+                    # Look for active sessions or console
                     if ($line -match 'Active' -or $line -match 'console') {
-                        # Extract session ID (typically in column after username)
+                        # Extract session ID
                         if ($line -match '\s+(\d+)\s+') {
                             $sessionId = $matches[1]
                             Write-LogEntry "Sending notification to session ID: ${sessionId}" "Information"
                             
-                            # Create simple message for msg.exe (avoid complex formatting)
-                            $msgBody = "Message from Nexus Open Systems Ltd: There are pending updates for " + ($PendingUpdates -join ", ") + ". Please restart your browsers to apply these security updates."
+                            # Create a temp file with the message (msg.exe works better with file input)
+                            $msgFile = "$env:TEMP\BrowserUpdateMsg_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
                             
-                            # Send message (wait time 0 = requires user to click OK)
-                            # Use Start-Process for better argument handling
-                            $msgProcess = Start-Process -FilePath "msg.exe" -ArgumentList "$sessionId","/TIME:0","`"$msgBody`"" -Wait -NoNewWindow -PassThru 2>&1
-                            Write-LogEntry "msg.exe completed for session ${sessionId} with exit code: $($msgProcess.ExitCode)" "Information"
+                            # Build message content
+                            $messageContent = @"
+Message from Nexus Open Systems Ltd
+
+We have found critical vulnerabilities on your system due to the following outdated browsers:
+
+"@
+                            
+                            if ($PendingUpdates -contains "Chrome") {
+                                $messageContent += "- Google Chrome`n"
+                            }
+                            if ($PendingUpdates -contains "Firefox") {
+                                $messageContent += "- Mozilla Firefox`n"
+                            }
+                            if ($PendingUpdates -contains "Edge") {
+                                $messageContent += "- Microsoft Edge`n"
+                            }
+                            
+                            $messageContent += "`nYou are advised to launch each of these browsers and apply the updates. If a browser is already open, please close the browser completely and reload it."
+                            
+                            # Write message to file
+                            $messageContent | Out-File -FilePath $msgFile -Encoding ASCII -Force
+                            
+                            # Send message using msg.exe with cmd.exe to handle file redirection
+                            $cmdString = "msg.exe $sessionId /TIME:0 < `"$msgFile`""
+                            cmd.exe /c $cmdString 2>&1 | Out-Null
+                            
+                            # Clean up the temp file
+                            Start-Sleep -Milliseconds 500
+                            Remove-Item -Path $msgFile -Force -ErrorAction SilentlyContinue
+                            
+                            Write-LogEntry "msg.exe notification sent to session ${sessionId}" "Information"
                         }
                     }
                 }
             }
             else {
-                Write-LogEntry "No user sessions found via query user" "Warning"
+                Write-LogEntry "No active user sessions found" "Warning"
             }
         }
         catch {
-            Write-LogEntry "Error in msg.exe method: $_" "Warning"
-        }
-        
-        # Method 2: Create a VBScript to show popup in user context
-        try {
-            $vbsPath = "$env:TEMP\BrowserUpdateNotification.vbs"
-            $vbsScript = @"
-Set objShell = CreateObject("WScript.Shell")
-objShell.Popup "$($message -replace '"', '""')", 0, "Message from Nexus Open Systems Ltd", 48
-"@
-            $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII -Force
-            
-            # Get logged-on user
-            $loggedOnUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
-            if ($loggedOnUser) {
-                Write-LogEntry "Attempting VBScript popup for user: $loggedOnUser" "Information"
-                Start-Process -FilePath "wscript.exe" -ArgumentList "`"$vbsPath`"" -WindowStyle Hidden
-                Start-Sleep -Seconds 2
-            }
-        }
-        catch {
-            Write-LogEntry "Error in VBScript method: $_" "Warning"
-        }
-        
-        # Method 3: Use PowerShell scheduled task to run as interactive user
-        try {
-            $scriptBlock = @"
-Add-Type -AssemblyName System.Windows.Forms
-[System.Windows.Forms.MessageBox]::Show('$($message -replace "'", "''")', 'Message from Nexus Open Systems Ltd', 'OK', 'Warning')
-"@
-            $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($scriptBlock))
-            
-            # Run in user context using schtasks
-            $taskName = "BrowserUpdateNotification_$([guid]::NewGuid().ToString().Substring(0,8))"
-            $loggedOnUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
-            
-            if ($loggedOnUser) {
-                Write-LogEntry "Creating scheduled task $taskName for user: $loggedOnUser" "Information"
-                
-                # Create and run task immediately
-                schtasks /Create /TN $taskName /TR "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedCommand" /SC ONCE /ST 00:00 /RU $loggedOnUser /RL HIGHEST /F | Out-Null
-                schtasks /Run /TN $taskName | Out-Null
-                
-                # Wait a moment then delete the task
-                Start-Sleep -Seconds 5
-                schtasks /Delete /TN $taskName /F | Out-Null
-                
-                Write-LogEntry "Scheduled task notification sent successfully" "Information"
-            }
-        }
-        catch {
-            Write-LogEntry "Error in scheduled task method: $_" "Warning"
+            Write-LogEntry "Error sending notification via msg.exe: $_" "Warning"
         }
     }
     else {
