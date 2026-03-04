@@ -184,40 +184,117 @@ function Show-UpdateNotification {
     $isSystem = $currentUser.User.Value -eq "S-1-5-18"
     
     if ($isSystem) {
-        # Running as SYSTEM - use msg.exe to notify active user session
+        # Running as SYSTEM - use multiple methods to ensure notification reaches user
+        Write-LogEntry "Running as SYSTEM - attempting user notification" "Information"
+        
+        # Method 1: Use msg.exe to send message to all active console sessions
         try {
-            # Get active session ID
-            $sessions = quser 2>$null
-            if ($sessions) {
-                $sessionIds = $sessions | ForEach-Object {
-                    if ($_ -notmatch "USERNAME" -and $_ -match '\d+') {
-                        $parts = $_ -split '\s+' | Where-Object { $_ }
-                        if ($parts[2] -match '^\d+$') {
-                            [int]$parts[2]
+            $queryResults = query user 2>$null
+            if ($queryResults) {
+                Write-LogEntry "Query user results: $($queryResults -join '; ')" "Information"
+                
+                # Parse each line to find active console sessions
+                $queryResults | Select-Object -Skip 1 | ForEach-Object {
+                    $line = $_
+                    # Look for console or active sessions
+                    if ($line -match 'Active' -or $line -match 'console') {
+                        # Extract session ID (typically in column after username)
+                        if ($line -match '\s+(\d+)\s+') {
+                            $sessionId = $matches[1]
+                            Write-LogEntry "Sending notification to session ID: ${sessionId}" "Information"
+                            
+                            # Create simple message for msg.exe (avoid complex formatting)
+                            $msgBody = "Message from Nexus Open Systems Ltd: There are pending updates for " + ($PendingUpdates -join ", ") + ". Please restart your browsers to apply these security updates."
+                            
+                            # Send message (wait time 0 = requires user to click OK)
+                            # Use Start-Process for better argument handling
+                            $msgProcess = Start-Process -FilePath "msg.exe" -ArgumentList "$sessionId","/TIME:0","`"$msgBody`"" -Wait -NoNewWindow -PassThru 2>&1
+                            Write-LogEntry "msg.exe completed for session ${sessionId} with exit code: $($msgProcess.ExitCode)" "Information"
                         }
                     }
-                } | Where-Object { $_ -gt 0 } | Select-Object -Unique
-                
-                foreach ($sessionId in $sessionIds) {
-                    # Send message to user session using msg.exe with company header
-                    $headerMsg = "Message from Nexus Open Systems Ltd`n`n"
-                    $fullMessage = $headerMsg + $message
-                    & msg.exe $sessionId $fullMessage /TIME:60 2>$null
                 }
+            }
+            else {
+                Write-LogEntry "No user sessions found via query user" "Warning"
             }
         }
         catch {
-            Write-LogEntry "Could not display notification to user session" "Warning"
+            Write-LogEntry "Error in msg.exe method: $_" "Warning"
+        }
+        
+        # Method 2: Create a VBScript to show popup in user context
+        try {
+            $vbsPath = "$env:TEMP\BrowserUpdateNotification.vbs"
+            $vbsScript = @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Popup "$($message -replace '"', '""')", 0, "Message from Nexus Open Systems Ltd", 48
+"@
+            $vbsScript | Out-File -FilePath $vbsPath -Encoding ASCII -Force
+            
+            # Get logged-on user
+            $loggedOnUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
+            if ($loggedOnUser) {
+                Write-LogEntry "Attempting VBScript popup for user: $loggedOnUser" "Information"
+                Start-Process -FilePath "wscript.exe" -ArgumentList "`"$vbsPath`"" -WindowStyle Hidden
+                Start-Sleep -Seconds 2
+            }
+        }
+        catch {
+            Write-LogEntry "Error in VBScript method: $_" "Warning"
+        }
+        
+        # Method 3: Use PowerShell scheduled task to run as interactive user
+        try {
+            $scriptBlock = @"
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.MessageBox]::Show('$($message -replace "'", "''")', 'Message from Nexus Open Systems Ltd', 'OK', 'Warning')
+"@
+            $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($scriptBlock))
+            
+            # Run in user context using schtasks
+            $taskName = "BrowserUpdateNotification_$([guid]::NewGuid().ToString().Substring(0,8))"
+            $loggedOnUser = (Get-WmiObject -Class Win32_ComputerSystem).UserName
+            
+            if ($loggedOnUser) {
+                Write-LogEntry "Creating scheduled task $taskName for user: $loggedOnUser" "Information"
+                
+                # Create and run task immediately
+                schtasks /Create /TN $taskName /TR "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedCommand" /SC ONCE /ST 00:00 /RU $loggedOnUser /RL HIGHEST /F | Out-Null
+                schtasks /Run /TN $taskName | Out-Null
+                
+                # Wait a moment then delete the task
+                Start-Sleep -Seconds 5
+                schtasks /Delete /TN $taskName /F | Out-Null
+                
+                Write-LogEntry "Scheduled task notification sent successfully" "Information"
+            }
+        }
+        catch {
+            Write-LogEntry "Error in scheduled task method: $_" "Warning"
         }
     }
     else {
-        # Running as regular user - use WScript.Shell popup
+        # Running as regular user - use multiple notification methods
+        Write-LogEntry "Running as user - showing notification" "Information"
+        
+        # Method 1: WScript.Shell popup (most compatible)
         try {
             $objShell = New-Object -ComObject Wscript.Shell
             $objShell.Popup($message, 0, "Message from Nexus Open Systems Ltd", 48)
+            Write-LogEntry "Notification displayed via WScript.Shell" "Information"
         }
         catch {
-            Write-LogEntry "Notification: $message" "Warning"
+            Write-LogEntry "WScript.Shell popup failed: $_" "Warning"
+            
+            # Method 2: Windows Forms MessageBox as fallback
+            try {
+                Add-Type -AssemblyName System.Windows.Forms
+                [System.Windows.Forms.MessageBox]::Show($message, "Message from Nexus Open Systems Ltd", "OK", "Warning")
+                Write-LogEntry "Notification displayed via MessageBox" "Information"
+            }
+            catch {
+                Write-LogEntry "All notification methods failed: $_" "Error"
+            }
         }
     }
 }
