@@ -57,6 +57,138 @@ function Write-LogEntry {
     Write-Host $entry
 }
 
+function Request-UpdateDeferral {
+    <#
+    .SYNOPSIS
+    Ask user if they want to defer the update
+    Returns $true if user wants to defer, $false to proceed with update
+    #>
+
+    # Check if running as SYSTEM
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+    $isSystem = $currentUser.User.Value -eq "S-1-5-18"
+
+    [string]$taskName = $null
+    [string]$psScriptPath = $null
+    [string]$markerFile = $null
+
+    if ($isSystem) {
+        Write-LogEntry "Running as SYSTEM - requesting user input for update deferral" "Information"
+
+        try {
+            # Get active user sessions
+            $queryResults = query user 2>$null
+            if ($queryResults) {
+                # Parse to get logged-on user
+                foreach ($line in ($queryResults | Select-Object -Skip 1)) {
+                    if ($line -match 'Active' -or $line -match 'console') {
+                        if ($line -match '\s+(\d+)\s+') {
+                            $sessionId = $matches[1]
+
+                            # Create a marker file location
+                            $markerFile = "$env:TEMP\UpdateDeferred_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
+
+                            # Create PowerShell script that shows MessageBox with Yes/No buttons
+                            $psScriptPath = "$env:TEMP\DeferUpdatePrompt_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
+
+                            $scriptContent = @"
+Add-Type -AssemblyName System.Windows.Forms
+`$result = [System.Windows.Forms.MessageBox]::Show(
+    'Browser updates are ready to be applied. Do you want to defer this update to a later time?`n`nClick YES to defer or NO to apply updates now.',
+    'Browser Updates Available',
+    'YesNo',
+    'Question'
+)
+if (`$result -eq 'Yes') {
+    'deferred' | Out-File -FilePath '$markerFile' -Force
+    Exit 1
+}
+else {
+    Exit 0
+}
+"@
+                            $scriptContent | Out-File -FilePath $psScriptPath -Encoding UTF8 -Force
+
+                            # Create scheduled task to run script in user context
+                            $taskName = "DeferUpdatePrompt_$([guid]::NewGuid().ToString().Substring(0,8))"
+
+                            Write-LogEntry "Showing deferral prompt to user" "Information"
+
+                            # Create and execute task
+                            $createCmd = "schtasks /Create /TN `"$taskName`" /TR `"powershell.exe -ExecutionPolicy Bypass -File `'$psScriptPath`'`" /SC ONCE /ST 00:00 /RU `"*`" /RL HIGHEST /IT /F"
+                            cmd.exe /c $createCmd 2>&1 | Out-Null
+
+                            # Run task
+                            & cmd.exe /c "schtasks /Run /TN `"$taskName`"" 2>&1 | Out-Null
+
+                            # Wait for user response
+                            Start-Sleep -Seconds 8
+
+                            # Check if deferral marker file was created
+                            if (Test-Path $markerFile) {
+                                Write-LogEntry "User chose to defer updates" "Information"
+                                return $true
+                            }
+
+                            Write-LogEntry "User chose to proceed with updates" "Information"
+                            return $false
+                        }
+                    }
+                }
+
+                Write-LogEntry "No active interactive user session detected for deferral prompt" "Warning"
+            }
+            else {
+                Write-LogEntry "No user sessions returned by 'query user'; proceeding without deferral prompt" "Warning"
+            }
+        }
+        catch {
+            Write-LogEntry "Error requesting update deferral: $_" "Warning"
+            return $false
+        }
+        finally {
+            # Best-effort cleanup for any temporary prompt artifacts.
+            if ($taskName) {
+                $deleteCmd = "schtasks /Delete /TN `"$taskName`" /F"
+                cmd.exe /c $deleteCmd 2>&1 | Out-Null
+            }
+            if ($psScriptPath) {
+                Start-Sleep -Milliseconds 500
+                Remove-Item -Path $psScriptPath -Force -ErrorAction SilentlyContinue
+            }
+            if ($markerFile) {
+                Remove-Item -Path $markerFile -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    else {
+        # Running as regular user - show MessageBox directly
+        try {
+            Add-Type -AssemblyName System.Windows.Forms
+            $result = [System.Windows.Forms.MessageBox]::Show(
+                'Browser updates are ready to be applied. Do you want to defer this update to a later time?`n`nClick YES to defer or NO to apply updates now.',
+                'Browser Updates Available',
+                'YesNo',
+                'Question'
+            )
+
+            if ($result -eq 'Yes') {
+                Write-LogEntry "User chose to defer updates" "Information"
+                return $true
+            }
+
+            Write-LogEntry "User chose to proceed with updates" "Information"
+            return $false
+        }
+        catch {
+            Write-LogEntry "Error requesting deferral in user context: $_" "Warning"
+            return $false
+        }
+    }
+
+    return $false
+}
+
 function Show-PreUpdateNotification {
     <#
     .SYNOPSIS
@@ -65,137 +197,16 @@ function Show-PreUpdateNotification {
     param(
         [array]$BrowsersToUpdate
     )
-    
+
     # Check if running as SYSTEM
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $isSystem = $currentUser.User.Value -eq "S-1-5-18"
-    
+
     if ($isSystem) {
         Write-LogEntry "Running as SYSTEM - notifying user of pending updates" "Information"
-        
+
         try {
-        function Request-UpdateDeferral {
-            <#
-            .SYNOPSIS
-            Ask user if they want to defer the update
-            Returns $true if user wants to defer, $false to proceed with update
-            #>
-    
-            # Check if running as SYSTEM
-            $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-            $isSystem = $currentUser.User.Value -eq "S-1-5-18"
-    
-            if ($isSystem) {
-                Write-LogEntry "Running as SYSTEM - requesting user input for update deferral" "Information"
-        
-                try {
-                    # Get active user sessions
-                    $queryResults = query user 2>$null
-                    if ($queryResults) {
-                        # Parse to get logged-on user
-                        $queryResults | Select-Object -Skip 1 | ForEach-Object {
-                            $line = $_
-                            if ($line -match 'Active' -or $line -match 'console') {
-                                if ($line -match '\s+(\d+)\s+') {
-                                    $sessionId = $matches[1]
-                            
-                                    # Create a marker file location
-                                    $markerFile = "$env:TEMP\UpdateDeferred_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
-                            
-                                    # Create PowerShell script that shows MessageBox with Yes/No buttons
-                                    $psScriptPath = "$env:TEMP\DeferUpdatePrompt_$([guid]::NewGuid().ToString().Substring(0,8)).ps1"
-                            
-                                    $scriptContent = @"
-        Add-Type -AssemblyName System.Windows.Forms
-        `$result = [System.Windows.Forms.MessageBox]::Show(
-            'Browser updates are ready to be applied. Do you want to defer this update to a later time?`n`nClick YES to defer or NO to apply updates now.',
-            'Browser Updates Available',
-            'YesNo',
-            'Question'
-        )
-        if (`$result -eq 'Yes') {
-            'deferred' | Out-File -FilePath '$markerFile' -Force
-            Exit 1
-        }
-        else {
-            Exit 0
-        }
-        "@
-                                    $scriptContent | Out-File -FilePath $psScriptPath -Encoding UTF8 -Force
-                            
-                                    # Create scheduled task to run script in user context
-                                    $taskName = "DeferUpdatePrompt_$([guid]::NewGuid().ToString().Substring(0,8))"
-                            
-                                    Write-LogEntry "Showing deferral prompt to user" "Information"
-                            
-                                    # Create and execute task
-                                    $createCmd = "schtasks /Create /TN `"$taskName`" /TR `"powershell.exe -ExecutionPolicy Bypass -File `'$psScriptPath`'`" /SC ONCE /ST 00:00 /RU `"*`" /RL HIGHEST /IT /F"
-                                    cmd.exe /c $createCmd 2>&1 | Out-Null
-                            
-                                    # Run task
-                                    & cmd.exe /c "schtasks /Run /TN `"$taskName`"" 2>&1 | Out-Null
-                            
-                                    # Wait for user response
-                                    Start-Sleep -Seconds 8
-                            
-                                    # Check if deferral marker file was created
-                                    $deferred = $false
-                                    if (Test-Path $markerFile) {
-                                        Write-LogEntry "User chose to defer updates" "Information"
-                                        $deferred = $true
-                                        Remove-Item -Path $markerFile -Force -ErrorAction SilentlyContinue
-                                    }
-                                    else {
-                                        Write-LogEntry "User chose to proceed with updates" "Information"
-                                    }
-                            
-                                    # Clean up task
-                                    $deleteCmd = "schtasks /Delete /TN `"$taskName`" /F"
-                                    cmd.exe /c $deleteCmd 2>&1 | Out-Null
-                            
-                                    # Clean up script file
-                                    Start-Sleep -Milliseconds 500
-                                    Remove-Item -Path $psScriptPath -Force -ErrorAction SilentlyContinue
-                            
-                                    return $deferred
-                                }
-                            }
-                        }
-                    }
-                }
-                catch {
-                    Write-LogEntry "Error requesting update deferral: $_" "Warning"
-                    return $false
-                }
-            }
-            else {
-                # Running as regular user - show MessageBox directly
-                try {
-                    Add-Type -AssemblyName System.Windows.Forms
-                    $result = [System.Windows.Forms.MessageBox]::Show(
-                        'Browser updates are ready to be applied. Do you want to defer this update to a later time?`n`nClick YES to defer or NO to apply updates now.',
-                        'Browser Updates Available',
-                        'YesNo',
-                        'Question'
-                    )
-            
-                    if ($result -eq 'Yes') {
-                        Write-LogEntry "User chose to defer updates" "Information"
-                        return $true
-                    }
-                    else {
-                        Write-LogEntry "User chose to proceed with updates" "Information"
-                        return $false
-                    }
-                }
-                catch {
-                    Write-LogEntry "Error requesting deferral in user context: $_" "Warning"
-                    return $false
-                }
-            }
-    
-            return $false
-        }
+            $notificationSent = $false
 
             # Get active user sessions
             $queryResults = query user 2>$null
@@ -209,10 +220,10 @@ function Show-PreUpdateNotification {
                         if ($line -match '\s+(\d+)\s+') {
                             $sessionId = $matches[1]
                             Write-LogEntry "Sending pre-update notification to session ID: ${sessionId}" "Information"
-                            
+
                             # Create temp file with notification
                             $msgFile = "$env:TEMP\BrowserPreUpdateMsg_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
-                            
+
                             # Build notification message
                             $messageContent = @"
 Message from Nexus Open Systems Ltd
@@ -222,28 +233,33 @@ BROWSER UPDATES IN PROGRESS
 The following browsers will now be updated to the latest version:
 
 "@
-                            
+
                             foreach ($browser in $BrowsersToUpdate) {
                                 $messageContent += "- $browser`n"
                             }
-                            
+
                             $messageContent += "`nPlease save any open work in these browsers before proceeding.`n`nThis may take a few minutes. Your browsers will be closed and automatically reopened after the updates are complete."
-                            
+
                             # Write message to file
                             $messageContent | Out-File -FilePath $msgFile -Encoding ASCII -Force
-                            
+
                             # Send notification using msg.exe
                             $cmdString = "msg.exe $sessionId /TIME:0 < `"$msgFile`""
                             cmd.exe /c $cmdString 2>&1 | Out-Null
-                            
+
                             # Clean up
                             Start-Sleep -Milliseconds 500
                             Remove-Item -Path $msgFile -Force -ErrorAction SilentlyContinue
-                            
+
                             Write-LogEntry "Pre-update notification sent to session ${sessionId}" "Information"
+                            $notificationSent = $true
                         }
                     }
                 }
+            }
+
+            if (-not $notificationSent) {
+                Write-LogEntry "No active user session found for pre-update notification" "Warning"
             }
         }
         catch {
@@ -261,15 +277,17 @@ function Show-PostUpdateNotification {
         [array]$UpdatedBrowsers,
         [array]$FailedUpdates
     )
-    
+
     # Check if running as SYSTEM
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent()
     $isSystem = $currentUser.User.Value -eq "S-1-5-18"
-    
+
     if ($isSystem) {
         Write-LogEntry "Running as SYSTEM - notifying user of completed updates" "Information"
-        
+
         try {
+            $notificationSent = $false
+
             # Get active user sessions
             $queryResults = query user 2>$null
             if ($queryResults) {
@@ -281,44 +299,49 @@ function Show-PostUpdateNotification {
                         # Extract session ID
                         if ($line -match '\s+(\d+)\s+') {
                             $sessionId = $matches[1]
-                            
+
                             # Create temp file with notification
                             $msgFile = "$env:TEMP\BrowserPostUpdateMsg_$([guid]::NewGuid().ToString().Substring(0,8)).txt"
-                            
+
                             # Build notification message
                             $messageContent = "Message from Nexus Open Systems Ltd`n`nBROWSER UPDATES COMPLETED`n`n"
-                            
+
                             if ($UpdatedBrowsers.Count -gt 0) {
                                 $messageContent += "Successfully updated:`n"
                                 foreach ($browser in $UpdatedBrowsers) {
                                     $messageContent += "- $browser`n"
                                 }
                             }
-                            
+
                             if ($FailedUpdates.Count -gt 0) {
                                 $messageContent += "`nUpdate attempts (may require manual restart):`n"
                                 foreach ($browser in $FailedUpdates) {
                                     $messageContent += "- $browser`n"
                                 }
                             }
-                            
+
                             $messageContent += "`nYour system is now more secure with the latest browser updates installed."
-                            
+
                             # Write message to file
                             $messageContent | Out-File -FilePath $msgFile -Encoding ASCII -Force
-                            
+
                             # Send notification using msg.exe
                             $cmdString = "msg.exe $sessionId /TIME:0 < `"$msgFile`""
                             cmd.exe /c $cmdString 2>&1 | Out-Null
-                            
+
                             # Clean up
                             Start-Sleep -Milliseconds 500
                             Remove-Item -Path $msgFile -Force -ErrorAction SilentlyContinue
-                            
+
                             Write-LogEntry "Post-update notification sent to session ${sessionId}" "Information"
+                            $notificationSent = $true
                         }
                     }
                 }
+            }
+
+            if (-not $notificationSent) {
+                Write-LogEntry "No active user session found for post-update notification" "Warning"
             }
         }
         catch {
@@ -504,9 +527,9 @@ if ((Test-Path "C:\Program Files\Microsoft\Edge\Application\msedge.exe") -or (Te
 # Notify user that updates are starting
 if ($browsersToUpdate.Count -gt 0) {
     Write-LogEntry "Requesting user deferral option" "Information"
-    $userDeferred = Request-UpdateDeferral
+    [bool]$userDeferred = Request-UpdateDeferral
     
-    if ($userDeferred) {
+    if ($true -eq $userDeferred) {
         Write-LogEntry "User deferred updates - exiting without applying changes" "Warning"
         Write-LogEntry "======================================" "Information"
         Write-LogEntry "Force Browser Updates Cancelled by User" "Information"
