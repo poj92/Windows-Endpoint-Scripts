@@ -60,35 +60,45 @@ function Write-LogEntry {
 function Test-ChromeUpdate {
     <#
     .DESCRIPTION
-    Checks if Google Chrome has a pending update
+    Checks if Google Chrome has a pending update by comparing the executable version with available version folders
     #>
     try {
-        $chromePath = "C:\Program Files\Google\Chrome\Application\chrome.exe"
-        $chromePathx86 = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+        $chromePaths = @(
+            "C:\Program Files\Google\Chrome\Application",
+            "C:\Program Files (x86)\Google\Chrome\Application"
+        )
         
-        if ((Test-Path $chromePath) -or (Test-Path $chromePathx86)) {
-            # Check for actual pending update indicators
-            # Chrome stores pending updates that need browser restart
-            
-            # Check HKLM for pending Google Update
-            $regUpdatePath = "HKLM:\SOFTWARE\Google\Update\ClientState\{8A69D345-D564-463c-AFF1-A69D9E530F96}"
-            if (Test-Path $regUpdatePath) {
-                $updateState = Get-ItemProperty -Path $regUpdatePath -ErrorAction SilentlyContinue
-                # Check if update is available (pv = pending version)
-                if ($updateState.pv) {
-                    return $true
-                }
-            }
-            
-            # Check for Chrome update executable in temp/pending locations
-            $updatePaths = @(
-                "$env:LOCALAPPDATA\Google\Chrome\User Data\SwReporter",
-                "C:\Program Files\Google\Chrome\Application\SetupMetrics"
-            )
-            
-            foreach ($path in $updatePaths) {
-                if (Test-Path "$path\*update*" -ErrorAction SilentlyContinue) {
-                    return $true
+        foreach ($appPath in $chromePaths) {
+            if (Test-Path $appPath) {
+                $exePath = Join-Path $appPath "chrome.exe"
+                
+                if (Test-Path $exePath) {
+                    # Get the version of the currently running executable
+                    $exeVersion = (Get-Item $exePath).VersionInfo.FileVersion
+                    if ([string]::IsNullOrEmpty($exeVersion)) {
+                        continue
+                    }
+                    
+                    # Get all version folders
+                    $versionFolders = Get-ChildItem -Path $appPath -Directory -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' }
+                    
+                    # Check if any version folder is newer than the running version
+                    foreach ($folder in $versionFolders) {
+                        try {
+                            $folderVersion = [version]$folder.Name
+                            $currentVersion = [version]$exeVersion
+                            
+                            if ($folderVersion -gt $currentVersion) {
+                                # A newer version folder exists - update is pending
+                                return $true
+                            }
+                        }
+                        catch {
+                            # Skip if version comparison fails
+                            continue
+                        }
+                    }
                 }
             }
         }
@@ -144,32 +154,45 @@ function Test-FirefoxUpdate {
 function Test-EdgeUpdate {
     <#
     .DESCRIPTION
-    Checks if Microsoft Edge has a pending update
+    Checks if Microsoft Edge has a pending update by comparing the executable version with available version folders
     #>
     try {
-        $edgePath = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
-        $edgePathx86 = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+        $edgePaths = @(
+            "C:\Program Files\Microsoft\Edge\Application",
+            "C:\Program Files (x86)\Microsoft\Edge\Application"
+        )
         
-        if ((Test-Path $edgePath) -or (Test-Path $edgePathx86)) {
-            # Check for actual pending Edge updates
-            # Edge uses similar update mechanism to Chrome
-            
-            # Check HKLM for pending Edge Update
-            $regUpdatePath = "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\ClientState\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"
-            if (Test-Path $regUpdatePath) {
-                $updateState = Get-ItemProperty -Path $regUpdatePath -ErrorAction SilentlyContinue
-                # Check if update is available (pv = pending version)
-                if ($updateState.pv) {
-                    return $true
-                }
-            }
-            
-            # Also check the WOW6432Node for 32-bit installs on 64-bit systems
-            $regUpdatePathWow = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"
-            if (Test-Path $regUpdatePathWow) {
-                $updateState = Get-ItemProperty -Path $regUpdatePathWow -ErrorAction SilentlyContinue
-                if ($updateState.pv) {
-                    return $true
+        foreach ($appPath in $edgePaths) {
+            if (Test-Path $appPath) {
+                $exePath = Join-Path $appPath "msedge.exe"
+                
+                if (Test-Path $exePath) {
+                    # Get the version of the currently running executable
+                    $exeVersion = (Get-Item $exePath).VersionInfo.FileVersion
+                    if ([string]::IsNullOrEmpty($exeVersion)) {
+                        continue
+                    }
+                    
+                    # Get all version folders
+                    $versionFolders = Get-ChildItem -Path $appPath -Directory -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' }
+                    
+                    # Check if any version folder is newer than the running version
+                    foreach ($folder in $versionFolders) {
+                        try {
+                            $folderVersion = [version]$folder.Name
+                            $currentVersion = [version]$exeVersion
+                            
+                            if ($folderVersion -gt $currentVersion) {
+                                # A newer version folder exists - update is pending
+                                return $true
+                            }
+                        }
+                        catch {
+                            # Skip if version comparison fails
+                            continue
+                        }
+                    }
                 }
             }
         }
