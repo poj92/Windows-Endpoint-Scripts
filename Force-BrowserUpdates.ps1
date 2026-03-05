@@ -363,29 +363,41 @@ function Update-ChromeNow {
         Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         Start-Sleep -Seconds 2
         
-        # Check for Chrome update utility
+        # Check for Chrome installation
         $chromePath = "C:\Program Files\Google\Chrome\Application"
         $chromePathx86 = "C:\Program Files (x86)\Google\Chrome\Application"
         
-        $updateUtility = $null
+        $chromeExe = $null
         if (Test-Path "$chromePath\chrome.exe") {
-            $updateUtility = $chromePath
+            $chromeExe = "$chromePath\chrome.exe"
         }
         elseif (Test-Path "$chromePathx86\chrome.exe") {
-            $updateUtility = $chromePathx86
+            $chromeExe = "$chromePathx86\chrome.exe"
         }
         
-        if ($updateUtility) {
-            # Trigger Chrome update check
-            Write-LogEntry "Triggering Chrome update check" "Information"
-            & "$updateUtility\chrome.exe" --offlineoff --enable-plugins 2>&1 | Out-Null
-            Start-Sleep -Seconds 5
+        if ($chromeExe) {
+            # Start Chrome with specific flags to trigger update
+            # Chrome checks for updates when started with --check-for-update-only flag
+            Write-LogEntry "Triggering Chrome update check with --check-for-update-only" "Information"
+            Start-Process -FilePath $chromeExe -ArgumentList "--update-check-only" -WindowStyle Hidden -ErrorAction SilentlyContinue -Wait
+            Start-Sleep -Seconds 3
             
-            # Start Chrome (it will update on startup if available)
-            Write-LogEntry "Starting Google Chrome" "Information"
-            Start-Process -FilePath "$updateUtility\chrome.exe" -WindowStyle Minimized -ErrorAction SilentlyContinue
+            # Start Chrome normally so it applies any pending updates
+            Write-LogEntry "Starting Google Chrome to apply updates" "Information"
+            Start-Process -FilePath $chromeExe -WindowStyle Minimized -ErrorAction SilentlyContinue
             
-            Write-LogEntry "Google Chrome update initiated" "Information"
+            # Wait for Chrome to fully load and update process to start
+            Start-Sleep -Seconds 15
+            
+            # Chrome will auto-update in background, close it to finalize
+            Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            
+            # Restart Chrome one more time to confirm update is applied
+            Write-LogEntry "Restarting Google Chrome to confirm update" "Information"
+            Start-Process -FilePath $chromeExe -WindowStyle Minimized -ErrorAction SilentlyContinue
+            
+            Write-LogEntry "Google Chrome update process completed" "Information"
             return $true
         }
         else {
@@ -403,6 +415,7 @@ function Update-FirefoxNow {
     <#
     .DESCRIPTION
     Force Mozilla Firefox to update immediately
+    Waits for update download and installation to complete
     #>
     Write-LogEntry "Attempting to force Mozilla Firefox update" "Information"
     
@@ -425,16 +438,28 @@ function Update-FirefoxNow {
         }
         
         if ($firefoxExe) {
-            # Start Firefox (it will check for updates on startup)
-            Write-LogEntry "Starting Mozilla Firefox for update check" "Information"
+            # Start Firefox and give it time to check for and download updates
+            Write-LogEntry "Starting Mozilla Firefox for update check and download" "Information"
             Start-Process -FilePath $firefoxExe -ArgumentList "-new-instance" -WindowStyle Minimized -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 10
+            
+            # Wait 60 seconds for Firefox to detect and download updates
+            # Firefox checks for updates on startup and downloads in background
+            Write-LogEntry "Waiting 60 seconds for Firefox update download" "Information"
+            Start-Sleep -Seconds 60
             
             # Close Firefox to allow update installation
+            Write-LogEntry "Closing Firefox to apply pending updates" "Information"
             Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 5
             
-            Write-LogEntry "Mozilla Firefox update initiated" "Information"
+            # Firefox will apply updates on next startup, so start it again
+            Write-LogEntry "Restarting Firefox to apply updates" "Information"
+            Start-Process -FilePath $firefoxExe -WindowStyle Minimized -ErrorAction SilentlyContinue
+            
+            # Wait another 30 seconds for update to be fully applied
+            Start-Sleep -Seconds 30
+            
+            Write-LogEntry "Mozilla Firefox update process completed" "Information"
             return $true
         }
         else {
@@ -452,6 +477,7 @@ function Update-EdgeNow {
     <#
     .DESCRIPTION
     Force Microsoft Edge to update immediately
+    Waits for update download and installation to complete
     #>
     Write-LogEntry "Attempting to force Microsoft Edge update" "Information"
     
@@ -474,16 +500,28 @@ function Update-EdgeNow {
         }
         
         if ($edgeExe) {
-            # Start Edge (it will check for updates on startup)
-            Write-LogEntry "Starting Microsoft Edge for update check" "Information"
+            # Start Edge and give it time to check for and download updates
+            Write-LogEntry "Starting Microsoft Edge for update check and download" "Information"
             Start-Process -FilePath $edgeExe -WindowStyle Minimized -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 10
+            
+            # Wait 60 seconds for Edge to detect and download updates
+            # Edge checks for updates on startup and downloads in background
+            Write-LogEntry "Waiting 60 seconds for Edge update download" "Information"
+            Start-Sleep -Seconds 60
             
             # Close Edge to allow update installation
+            Write-LogEntry "Closing Edge to apply pending updates" "Information"
             Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
+            Start-Sleep -Seconds 5
             
-            Write-LogEntry "Microsoft Edge update initiated" "Information"
+            # Edge will apply updates on next startup, so start it again
+            Write-LogEntry "Restarting Edge to apply updates" "Information"
+            Start-Process -FilePath $edgeExe -WindowStyle Minimized -ErrorAction SilentlyContinue
+            
+            # Wait another 30 seconds for update to be fully applied
+            Start-Sleep -Seconds 30
+            
+            Write-LogEntry "Microsoft Edge update process completed" "Information"
             return $true
         }
         else {
