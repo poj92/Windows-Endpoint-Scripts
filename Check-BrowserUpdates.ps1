@@ -67,15 +67,29 @@ function Test-ChromeUpdate {
         $chromePathx86 = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
         
         if ((Test-Path $chromePath) -or (Test-Path $chromePathx86)) {
-            # Check for Chrome update folder/file indicators
-            $updatePath = "$env:LOCALAPPDATA\Google\Chrome\User Data"
+            # Check for actual pending update indicators
+            # Chrome stores pending updates that need browser restart
             
-            # Check if there's an update pending in registry
-            $regPath = "HKCU:\Software\Google\Chrome"
-            if (Test-Path $regPath) {
-                $updateCheckTime = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
-                # Chrome auto-updates; if LastUpdateTime exists and is recent, update might be pending
-                return $true  # Chrome typically has pending updates
+            # Check HKLM for pending Google Update
+            $regUpdatePath = "HKLM:\SOFTWARE\Google\Update\ClientState\{8A69D345-D564-463c-AFF1-A69D9E530F96}"
+            if (Test-Path $regUpdatePath) {
+                $updateState = Get-ItemProperty -Path $regUpdatePath -ErrorAction SilentlyContinue
+                # Check if update is available (pv = pending version)
+                if ($updateState.pv) {
+                    return $true
+                }
+            }
+            
+            # Check for Chrome update executable in temp/pending locations
+            $updatePaths = @(
+                "$env:LOCALAPPDATA\Google\Chrome\User Data\SwReporter",
+                "C:\Program Files\Google\Chrome\Application\SetupMetrics"
+            )
+            
+            foreach ($path in $updatePaths) {
+                if (Test-Path "$path\*update*" -ErrorAction SilentlyContinue) {
+                    return $true
+                }
             }
         }
         return $false
@@ -95,21 +109,29 @@ function Test-FirefoxUpdate {
         $firefoxPathx86 = "C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
         
         if ((Test-Path $firefoxPath) -or (Test-Path $firefoxPathx86)) {
-            # Check for Firefox update indicator files
-            $firefoxUpdatePath = "$env:LOCALAPPDATA\Mozilla\Firefox"
+            # Check for actual Firefox update files in the updates directory
+            $updatesPaths = @(
+                "C:\Program Files\Mozilla Firefox\updates",
+                "C:\Program Files (x86)\Mozilla Firefox\updates"
+            )
             
-            # Check if updates pending folder exists
-            if (Test-Path "$firefoxUpdatePath\updates") {
-                $updateFiles = Get-ChildItem -Path "$firefoxUpdatePath\updates" -ErrorAction SilentlyContinue
-                if ($updateFiles) {
-                    return $true
+            foreach ($updatesPath in $updatesPaths) {
+                if (Test-Path $updatesPath) {
+                    # Check for active-update.xml which indicates a downloaded/pending update
+                    $activeUpdateFile = Join-Path $updatesPath "active-update.xml"
+                    if (Test-Path $activeUpdateFile) {
+                        return $true
+                    }
+                    
+                    # Check for update directories with .mar files (Mozilla Archive)
+                    $updateDirs = Get-ChildItem -Path $updatesPath -Directory -ErrorAction SilentlyContinue
+                    foreach ($dir in $updateDirs) {
+                        $marFiles = Get-ChildItem -Path $dir.FullName -Filter "*.mar" -ErrorAction SilentlyContinue
+                        if ($marFiles) {
+                            return $true
+                        }
+                    }
                 }
-            }
-            
-            # Check Firefox registry for update info
-            $regPath = "HKCU:\Software\Mozilla\Firefox"
-            if (Test-Path $regPath) {
-                return $true  # Firefox typically has auto-update enabled
             }
         }
         return $false
@@ -129,21 +151,26 @@ function Test-EdgeUpdate {
         $edgePathx86 = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
         
         if ((Test-Path $edgePath) -or (Test-Path $edgePathx86)) {
-            # Check Windows Update for Edge updates
-            # Edge is often updated through Windows Update
+            # Check for actual pending Edge updates
+            # Edge uses similar update mechanism to Chrome
             
-            # Check for Edge update scheduled task
-            $edgeUpdateTask = Get-ScheduledTask -TaskName "*Edge*" -ErrorAction SilentlyContinue | 
-                              Where-Object { $_.State -eq "Ready" }
-            
-            if ($edgeUpdateTask) {
-                return $true
+            # Check HKLM for pending Edge Update
+            $regUpdatePath = "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\ClientState\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"
+            if (Test-Path $regUpdatePath) {
+                $updateState = Get-ItemProperty -Path $regUpdatePath -ErrorAction SilentlyContinue
+                # Check if update is available (pv = pending version)
+                if ($updateState.pv) {
+                    return $true
+                }
             }
             
-            # Check Edge registry for update info
-            $regPath = "HKCU:\Software\Microsoft\Edge\Update"
-            if (Test-Path $regPath) {
-                return $true
+            # Also check the WOW6432Node for 32-bit installs on 64-bit systems
+            $regUpdatePathWow = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\ClientState\{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}"
+            if (Test-Path $regUpdatePathWow) {
+                $updateState = Get-ItemProperty -Path $regUpdatePathWow -ErrorAction SilentlyContinue
+                if ($updateState.pv) {
+                    return $true
+                }
             }
         }
         return $false
