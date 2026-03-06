@@ -1,6 +1,3 @@
-# PowerShell Script to Detect Browser Update Conditions
-# Script must be run in system context.
-
 #Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 
@@ -11,7 +8,7 @@ $BasePath = "C:\ProgramData\Datto\BrowserUpdateCheck"
 $LogFile = Join-Path $BasePath "Detection.log"
 $TrackingFile = Join-Path $BasePath "BrowserUsageTracking.json"
 $QueueFile = Join-Path $BasePath "ReloadQueue.json"
-$InactivityThresholdHours = 72
+$BrowserReloadThresholdHours = 24
 
 # =========================
 # Bootstrap
@@ -226,7 +223,7 @@ function Test-BrowserSessionAge {
         $age = $now - $started
 
         if ($age.TotalHours -ge $ThresholdHours) {
-            Write-LogEntry "$BrowserName has been running continuously for $([math]::Round($age.TotalHours,2)) hours"
+            Write-LogEntry "$BrowserName has been running continuously for $([math]::Round($age.TotalHours,2)) hours, which meets the threshold"
             return $true
         }
 
@@ -423,6 +420,7 @@ function Save-ReloadQueue {
 try {
     Write-LogEntry "======================================"
     Write-LogEntry "Browser reload detection started"
+    Write-LogEntry "Threshold set to $BrowserReloadThresholdHours hours"
     Write-LogEntry "======================================"
 
     $tracking = Update-BrowserSessionTracking
@@ -430,11 +428,11 @@ try {
 
     if (Get-ChromeInstallPath) {
         Write-LogEntry "Evaluating Chrome"
-        if ((Test-BrowserSessionAge -BrowserName "Chrome" -TrackingData $tracking -ThresholdHours $InactivityThresholdHours) -and
+        if ((Test-BrowserSessionAge -BrowserName "Chrome" -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours) -and
             (Test-ChromePendingUpdate)) {
             $queue += [PSCustomObject]@{
                 Browser = "Chrome"
-                Reason  = "Pending update and session/inactivity threshold exceeded"
+                Reason  = "Pending update and 24-hour browser reload threshold exceeded"
             }
             Write-LogEntry "Chrome added to reload queue"
         }
@@ -442,11 +440,11 @@ try {
 
     if (Get-FirefoxInstallPath) {
         Write-LogEntry "Evaluating Firefox"
-        if ((Test-BrowserSessionAge -BrowserName "Firefox" -TrackingData $tracking -ThresholdHours $InactivityThresholdHours) -and
+        if ((Test-BrowserSessionAge -BrowserName "Firefox" -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours) -and
             (Test-FirefoxPendingUpdate)) {
             $queue += [PSCustomObject]@{
                 Browser = "Firefox"
-                Reason  = "Pending update and session/inactivity threshold exceeded"
+                Reason  = "Pending update and 24-hour browser reload threshold exceeded"
             }
             Write-LogEntry "Firefox added to reload queue"
         }
@@ -454,11 +452,11 @@ try {
 
     if (Get-EdgeInstallPath) {
         Write-LogEntry "Evaluating Edge"
-        if ((Test-BrowserSessionAge -BrowserName "Edge" -TrackingData $tracking -ThresholdHours $InactivityThresholdHours) -and
+        if ((Test-BrowserSessionAge -BrowserName "Edge" -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours) -and
             (Test-EdgePendingUpdate)) {
             $queue += [PSCustomObject]@{
                 Browser = "Edge"
-                Reason  = "Pending update and session/inactivity threshold exceeded"
+                Reason  = "Pending update and 24-hour browser reload threshold exceeded"
             }
             Write-LogEntry "Edge added to reload queue"
         }
