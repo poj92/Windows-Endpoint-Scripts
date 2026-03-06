@@ -1,6 +1,7 @@
 # PowerShell Script to Force Browser Reload for Pending Updates
 # Monitors browser usage and forces reload if:
 # - Browser has not been opened in 72 hours
+# - Browser has been open continuously for 72 hours
 # - Browser has a pending update
 # - Gives user 5-minute warning before automatic reload
 
@@ -59,6 +60,188 @@ function Write-LogEntry {
     
     # Also output to console for Datto
     Write-Host $entry
+}
+
+function Get-ChromeVersion {
+    <#
+    .SYNOPSIS
+    Get installed Chrome version from registry
+    #>
+    try {
+        $path = "HKLM:\SOFTWARE\Google\Chrome\BLBeacon"
+        if (Test-Path $path) {
+            return (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue).version
+        }
+    }
+    catch {
+        Write-LogEntry "Error reading Chrome installed version: $_" "Warning"
+    }
+
+    return $null
+}
+
+function Get-EdgeVersion {
+    <#
+    .SYNOPSIS
+    Get installed Edge version from registry
+    #>
+    try {
+        $path = "HKLM:\SOFTWARE\Microsoft\Edge\BLBeacon"
+        if (Test-Path $path) {
+            return (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue).version
+        }
+    }
+    catch {
+        Write-LogEntry "Error reading Edge installed version: $_" "Warning"
+    }
+
+    return $null
+}
+
+function Get-FirefoxVersion {
+    <#
+    .SYNOPSIS
+    Get installed Firefox version from registry
+    #>
+    try {
+        $path = "HKLM:\SOFTWARE\Mozilla\Mozilla Firefox"
+        if (Test-Path $path) {
+            return (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue)."CurrentVersion"
+        }
+    }
+    catch {
+        Write-LogEntry "Error reading Firefox installed version: $_" "Warning"
+    }
+
+    return $null
+}
+
+function Get-LatestChromeVersion {
+    <#
+    .SYNOPSIS
+    Get latest stable Chrome version from Google API
+    #>
+    try {
+        $response = Invoke-RestMethod -Uri "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions" -TimeoutSec 20 -ErrorAction Stop
+        if ($response.versions -and $response.versions.Count -gt 0) {
+            return $response.versions[0].version
+        }
+    }
+    catch {
+        Write-LogEntry "Unable to fetch latest Chrome version: $_" "Warning"
+    }
+
+    return $null
+}
+
+function Get-LatestEdgeVersion {
+    <#
+    .SYNOPSIS
+    Get latest stable Edge version from Microsoft API
+    #>
+    try {
+        $response = Invoke-RestMethod -Uri "https://edgeupdates.microsoft.com/api/products" -TimeoutSec 20 -ErrorAction Stop
+        $stableRelease = $response.ProductReleases | Where-Object { $_.Product -eq "Stable" } | Select-Object -First 1
+
+        if ($stableRelease) {
+            return $stableRelease.ProductVersion
+        }
+    }
+    catch {
+        Write-LogEntry "Unable to fetch latest Edge version: $_" "Warning"
+    }
+
+    return $null
+}
+
+function Get-LatestFirefoxVersion {
+    <#
+    .SYNOPSIS
+    Get latest stable Firefox version from Mozilla API
+    #>
+    try {
+        $response = Invoke-RestMethod -Uri "https://product-details.mozilla.org/1.0/firefox_versions.json" -TimeoutSec 20 -ErrorAction Stop
+        return $response.LATEST_FIREFOX_VERSION
+    }
+    catch {
+        Write-LogEntry "Unable to fetch latest Firefox version: $_" "Warning"
+    }
+
+    return $null
+}
+
+function Get-BrowserVersionStatus {
+    <#
+    .SYNOPSIS
+    Return installed/latest/up-to-date status for detected browsers
+    #>
+    $results = @()
+
+    $installedChrome = Get-ChromeVersion
+    if ($installedChrome) {
+        $latestChrome = Get-LatestChromeVersion
+        $results += [PSCustomObject]@{
+            Browser = "Chrome"
+            Installed = $installedChrome
+            Latest = $(if ($latestChrome) { $latestChrome } else { "Unknown" })
+            UpToDate = $(if ($latestChrome) { $installedChrome -eq $latestChrome } else { $null })
+        }
+    }
+
+    $installedEdge = Get-EdgeVersion
+    if ($installedEdge) {
+        $latestEdge = Get-LatestEdgeVersion
+        $results += [PSCustomObject]@{
+            Browser = "Edge"
+            Installed = $installedEdge
+            Latest = $(if ($latestEdge) { $latestEdge } else { "Unknown" })
+            UpToDate = $(if ($latestEdge) { $installedEdge -eq $latestEdge } else { $null })
+        }
+    }
+
+    $installedFirefox = Get-FirefoxVersion
+    if ($installedFirefox) {
+        $latestFirefox = Get-LatestFirefoxVersion
+        $results += [PSCustomObject]@{
+            Browser = "Firefox"
+            Installed = $installedFirefox
+            Latest = $(if ($latestFirefox) { $latestFirefox } else { "Unknown" })
+            UpToDate = $(if ($latestFirefox) { $installedFirefox -eq $latestFirefox } else { $null })
+        }
+    }
+
+    return $results
+}
+
+function Write-BrowserVersionSummary {
+    <#
+    .SYNOPSIS
+    Log browser version status summary
+    #>
+    param(
+        [object[]]$VersionResults
+    )
+
+    if (-not $VersionResults -or $VersionResults.Count -eq 0) {
+        Write-LogEntry "No supported browsers detected for version comparison" "Information"
+        return
+    }
+
+    Write-LogEntry "Browser version status summary:" "Information"
+
+    foreach ($result in $VersionResults) {
+        $upToDateText = if ($null -eq $result.UpToDate) {
+            "Unknown"
+        }
+        elseif ($result.UpToDate) {
+            "Yes"
+        }
+        else {
+            "No"
+        }
+
+        Write-LogEntry "$($result.Browser): Installed=$($result.Installed) | Latest=$($result.Latest) | UpToDate=$upToDateText" "Information"
+    }
 }
 
 function Get-BrowserUsageTracking {
@@ -637,6 +820,10 @@ Update-BrowserSessionTracking
 
 # Load tracking data
 $tracking = Get-BrowserUsageTracking
+
+# Check and log version status for detected browsers
+$versionResults = Get-BrowserVersionStatus
+Write-BrowserVersionSummary -VersionResults $versionResults
 
 # Check each browser
 $browsersToReload = @()
