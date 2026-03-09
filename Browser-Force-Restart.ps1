@@ -79,7 +79,7 @@ function Remove-ScheduledTaskIfRequested {
     }
 
     try {
-        cmd.exe /c "schtasks /Delete /TN `"$TaskName`" /F" 1>$null 2>$null | Out-Null
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
         Write-LogEntry "Deleted scheduled task '$TaskName' after launch"
     }
     catch {
@@ -126,9 +126,9 @@ function Get-BrowserProcessName {
     )
 
     switch ($BrowserName) {
-        "Chrome"  { return "chrome" }
-        "Firefox" { return "firefox" }
-        "Edge"    { return "msedge" }
+        "Chrome"  { "chrome" }
+        "Firefox" { "firefox" }
+        "Edge"    { "msedge" }
     }
 }
 
@@ -265,9 +265,9 @@ function Get-BrowserExecutablePath {
     )
 
     switch ($BrowserName) {
-        "Chrome"  { return (Get-ChromeInstallPath) }
-        "Firefox" { return (Get-FirefoxInstallPath) }
-        "Edge"    { return (Get-EdgeInstallPath) }
+        "Chrome"  { Get-ChromeInstallPath }
+        "Firefox" { Get-FirefoxInstallPath }
+        "Edge"    { Get-EdgeInstallPath }
     }
 }
 
@@ -277,7 +277,7 @@ function New-UniqueTaskName {
         [string]$BrowserName
     )
 
-    return "NexusBrowserReload_{0}_{1}" -f $BrowserName, ([guid]::NewGuid().ToString("N").Substring(0,8))
+    "NexusBrowserReload_{0}_{1}" -f $BrowserName, ([guid]::NewGuid().ToString("N").Substring(0,8))
 }
 
 function Register-PostponeScheduledTask {
@@ -294,16 +294,39 @@ function Register-PostponeScheduledTask {
         }
 
         $taskName = New-UniqueTaskName -BrowserName $BrowserName
-        $taskTime = $RunAtLocal.ToString("HH:mm")
-        $taskDate = $RunAtLocal.ToString("MM/dd/yyyy")
         $currentUser = Get-CurrentUserSam
 
-        $taskCommand = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Normal -File `"$ScriptPath`" -ScheduledTaskName `"$taskName`""
-        $createCmd = "schtasks /Create /TN `"$taskName`" /TR `"$taskCommand`" /SC ONCE /SD $taskDate /ST $taskTime /RU `"$currentUser`" /IT /F"
-        $result = cmd.exe /c $createCmd 2>&1
+        $action = New-ScheduledTaskAction `
+            -Execute "powershell.exe" `
+            -Argument "-ExecutionPolicy Bypass -WindowStyle Normal -File `"$ScriptPath`" -ScheduledTaskName `"$taskName`""
 
-        if ($LASTEXITCODE -ne 0) {
-            throw "schtasks returned exit code $LASTEXITCODE. Output: $($result -join ' ')"
+        $trigger = New-ScheduledTaskTrigger -Once -At $RunAtLocal
+
+        $principal = New-ScheduledTaskPrincipal `
+            -UserId $currentUser `
+            -LogonType Interactive `
+            -RunLevel Limited
+
+        $settings = New-ScheduledTaskSettingsSet `
+            -StartWhenAvailable `
+            -AllowStartIfOnBatteries `
+            -DontStopIfGoingOnBatteries `
+            -ExecutionTimeLimit (New-TimeSpan -Hours 1)
+
+        $task = New-ScheduledTask `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings
+
+        Register-ScheduledTask -TaskName $taskName -InputObject $task -Force | Out-Null
+
+        try {
+            $null = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+            Write-LogEntry "Verified scheduled task '$taskName' exists"
+        }
+        catch {
+            Write-LogEntry "Scheduled task '$taskName' could not be verified after creation" "Warning"
         }
 
         Write-LogEntry "Scheduled task '$taskName' created for $BrowserName at $($RunAtLocal.ToString('yyyy-MM-dd HH:mm:ss')) as $currentUser"
@@ -334,7 +357,7 @@ function Show-CountdownWarning {
 
         $form = New-Object System.Windows.Forms.Form
         $form.Text = "$CompanyName - $BrowserName restart required"
-        $form.Size = New-Object System.Drawing.Size(660,340)
+        $form.Size = New-Object System.Drawing.Size(680,360)
         $form.StartPosition = 'CenterScreen'
         $form.TopMost = $true
         $form.FormBorderStyle = 'FixedDialog'
@@ -344,28 +367,28 @@ function Show-CountdownWarning {
 
         $headerLabel = New-Object System.Windows.Forms.Label
         $headerLabel.Location = New-Object System.Drawing.Point(20,20)
-        $headerLabel.Size = New-Object System.Drawing.Size(600,25)
+        $headerLabel.Size = New-Object System.Drawing.Size(620,25)
         $headerLabel.Text = "Message from $CompanyName"
         $headerLabel.Font = New-Object System.Drawing.Font('Segoe UI',11,[System.Drawing.FontStyle]::Bold)
         $form.Controls.Add($headerLabel)
 
         $label = New-Object System.Windows.Forms.Label
         $label.Location = New-Object System.Drawing.Point(20,55)
-        $label.Size = New-Object System.Drawing.Size(600,70)
+        $label.Size = New-Object System.Drawing.Size(620,70)
         $label.Text = "$CompanyName needs to restart $BrowserName to complete a pending security and stability update. The restart will happen automatically in:"
         $label.Font = New-Object System.Drawing.Font('Segoe UI',10)
         $form.Controls.Add($label)
 
         $countdownLabel = New-Object System.Windows.Forms.Label
         $countdownLabel.Location = New-Object System.Drawing.Point(20,125)
-        $countdownLabel.Size = New-Object System.Drawing.Size(600,40)
+        $countdownLabel.Size = New-Object System.Drawing.Size(620,40)
         $countdownLabel.Font = New-Object System.Drawing.Font('Segoe UI',18,[System.Drawing.FontStyle]::Bold)
         $countdownLabel.TextAlign = 'MiddleCenter'
         $form.Controls.Add($countdownLabel)
 
         $postponeLabel = New-Object System.Windows.Forms.Label
-        $postponeLabel.Location = New-Object System.Drawing.Point(120,185)
-        $postponeLabel.Size = New-Object System.Drawing.Size(180,25)
+        $postponeLabel.Location = New-Object System.Drawing.Point(115,185)
+        $postponeLabel.Size = New-Object System.Drawing.Size(190,25)
         $postponeLabel.Text = "Postpone restart for:"
         $postponeLabel.Font = New-Object System.Drawing.Font('Segoe UI',10)
         $form.Controls.Add($postponeLabel)
@@ -374,11 +397,12 @@ function Show-CountdownWarning {
         $comboBox.Location = New-Object System.Drawing.Point(305,182)
         $comboBox.Size = New-Object System.Drawing.Size(180,25)
         $comboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        [void]$comboBox.Items.Add("5 minutes")
         [void]$comboBox.Items.Add("30 minutes")
         [void]$comboBox.Items.Add("1 hour")
         [void]$comboBox.Items.Add("2 hours")
         [void]$comboBox.Items.Add("4 hours")
-        $comboBox.SelectedIndex = 1
+        $comboBox.SelectedIndex = 2
         $form.Controls.Add($comboBox)
 
         $restartNowButton = New-Object System.Windows.Forms.Button
@@ -397,6 +421,7 @@ function Show-CountdownWarning {
         $postponeButton.Text = 'Postpone Restart'
         $postponeButton.Add_Click({
             switch ($comboBox.SelectedItem) {
+                "5 minutes"  { $script:SelectedPostponeMinutes = 5 }
                 "30 minutes" { $script:SelectedPostponeMinutes = 30 }
                 "1 hour"     { $script:SelectedPostponeMinutes = 60 }
                 "2 hours"    { $script:SelectedPostponeMinutes = 120 }
@@ -409,8 +434,8 @@ function Show-CountdownWarning {
         $form.Controls.Add($postponeButton)
 
         $footerLabel = New-Object System.Windows.Forms.Label
-        $footerLabel.Location = New-Object System.Drawing.Point(20,285)
-        $footerLabel.Size = New-Object System.Drawing.Size(600,20)
+        $footerLabel.Location = New-Object System.Drawing.Point(20,295)
+        $footerLabel.Size = New-Object System.Drawing.Size(620,20)
         $footerLabel.Text = "You can restart now or postpone this restart for a limited time."
         $footerLabel.Font = New-Object System.Drawing.Font('Segoe UI',9)
         $form.Controls.Add($footerLabel)
@@ -438,14 +463,14 @@ function Show-CountdownWarning {
         $timer.Start()
         [void]$form.ShowDialog()
 
-        return [PSCustomObject]@{
+        [PSCustomObject]@{
             Action          = $script:UserDecision
             PostponeMinutes = $script:SelectedPostponeMinutes
         }
     }
     catch {
         Write-LogEntry "Popup failed for $BrowserName : $($_.Exception.Message)" "Error"
-        return [PSCustomObject]@{
+        [PSCustomObject]@{
             Action          = "Restart"
             PostponeMinutes = 60
         }
@@ -571,20 +596,26 @@ try {
 
         if ($decision.Action -eq "Postpone") {
             $runAtLocal = (Get-Date).AddMinutes([int]$decision.PostponeMinutes)
-            $item.PostponeUntilUtc = $runAtLocal.ToUniversalTime().ToString("o")
-            $item.PostponeChoice = "$($decision.PostponeMinutes) minutes"
+
+            $updatedItem = [PSCustomObject]@{
+                Browser           = $item.Browser
+                Reason            = $item.Reason
+                PostponeUntilUtc  = $runAtLocal.ToUniversalTime().ToString("o")
+                PostponeChoice    = "$($decision.PostponeMinutes) minutes"
+                ScheduledTaskName = $null
+            }
 
             $taskName = Register-PostponeScheduledTask -BrowserName $browser -RunAtLocal $runAtLocal -ScriptPath $RemediationScriptPath
 
             if ($taskName) {
-                $item.ScheduledTaskName = $taskName
-                Write-LogEntry "$browser postponed until $($item.PostponeUntilUtc) ($($item.PostponeChoice)); scheduled task '$taskName' created"
+                $updatedItem.ScheduledTaskName = $taskName
+                Write-LogEntry "$browser postponed until $($updatedItem.PostponeUntilUtc) ($($updatedItem.PostponeChoice)); scheduled task '$taskName' created"
             }
             else {
                 Write-LogEntry "Scheduled task creation failed for $browser; leaving item queued for retry" "Warning"
             }
 
-            $remainingQueue += $item
+            $remainingQueue += $updatedItem
             continue
         }
 
@@ -600,6 +631,14 @@ try {
     }
 
     Save-ReloadQueue -Browsers $remainingQueue
+
+    try {
+        $savedQueueCheck = Get-Content -Path $QueueFile -Raw -ErrorAction Stop
+        Write-LogEntry "Queue file saved successfully: $savedQueueCheck"
+    }
+    catch {
+        Write-LogEntry "Unable to re-read queue file after saving: $($_.Exception.Message)" "Warning"
+    }
 
     if ($remainingQueue.Count -gt 0) {
         Write-LogEntry "$($remainingQueue.Count) browser(s) remain queued for retry"

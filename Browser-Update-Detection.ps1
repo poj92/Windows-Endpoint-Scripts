@@ -202,10 +202,10 @@ function Get-BrowserStateInfo {
         if ([string]::IsNullOrWhiteSpace($state.LastStart)) {
             Write-LogEntry "$BrowserName is running but LastStart is unknown. Skipping on this pass." "Warning"
             return [PSCustomObject]@{
-                IsRunning = $true
-                Hours = 0
+                IsRunning    = $true
+                Hours        = 0
                 ThresholdMet = $false
-                Condition = "Running"
+                Condition    = "Running"
             }
         }
 
@@ -216,29 +216,29 @@ function Get-BrowserStateInfo {
         if ($age.TotalHours -ge $ThresholdHours) {
             Write-LogEntry "$BrowserName has been running continuously for $hours hours, which meets the threshold"
             return [PSCustomObject]@{
-                IsRunning = $true
-                Hours = $hours
+                IsRunning    = $true
+                Hours        = $hours
                 ThresholdMet = $true
-                Condition = "Running"
+                Condition    = "Running"
             }
         }
 
         Write-LogEntry "$BrowserName has been running for $hours hours"
         return [PSCustomObject]@{
-            IsRunning = $true
-            Hours = $hours
+            IsRunning    = $true
+            Hours        = $hours
             ThresholdMet = $false
-            Condition = "Running"
+            Condition    = "Running"
         }
     }
 
     if ([string]::IsNullOrWhiteSpace($state.LastStop)) {
         Write-LogEntry "$BrowserName has not yet recorded a LastStop. Skipping on this pass."
         return [PSCustomObject]@{
-            IsRunning = $false
-            Hours = 0
+            IsRunning    = $false
+            Hours        = 0
             ThresholdMet = $false
-            Condition = "Closed"
+            Condition    = "Closed"
         }
     }
 
@@ -249,19 +249,19 @@ function Get-BrowserStateInfo {
     if ($inactive.TotalHours -ge $ThresholdHours) {
         Write-LogEntry "$BrowserName has been observed closed for $hoursClosed hours, which meets the threshold"
         return [PSCustomObject]@{
-            IsRunning = $false
-            Hours = $hoursClosed
+            IsRunning    = $false
+            Hours        = $hoursClosed
             ThresholdMet = $true
-            Condition = "Closed"
+            Condition    = "Closed"
         }
     }
 
     Write-LogEntry "$BrowserName has been observed closed for $hoursClosed hours"
     return [PSCustomObject]@{
-        IsRunning = $false
-        Hours = $hoursClosed
+        IsRunning    = $false
+        Hours        = $hoursClosed
         ThresholdMet = $false
-        Condition = "Closed"
+        Condition    = "Closed"
     }
 }
 
@@ -558,16 +558,47 @@ function Get-BrowserVersionStatus {
     }
 
     $outOfDate = Compare-VersionNewer -Installed $installed -Latest $latest
-
     $upToDateText = if ($null -eq $outOfDate) { "Unknown" } elseif (-not $outOfDate) { "Yes" } else { "No" }
     Write-LogEntry "$BrowserName version status: Installed=$installed | Latest=$latest | UpToDate=$upToDateText | PendingUpdate=$pending"
 
     [PSCustomObject]@{
-        Browser = $BrowserName
-        Installed = $installed
-        Latest = $latest
-        OutOfDate = $outOfDate
+        Browser       = $BrowserName
+        Installed     = $installed
+        Latest        = $latest
+        OutOfDate     = $outOfDate
         PendingUpdate = $pending
+    }
+}
+
+function Get-ExistingReloadQueue {
+    if (-not (Test-Path $QueueFile)) {
+        return @()
+    }
+
+    try {
+        $queue = Get-Content -Path $QueueFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+        if (-not $queue -or -not $queue.Browsers) {
+            return @()
+        }
+
+        foreach ($item in $queue.Browsers) {
+            if (-not ($item.PSObject.Properties.Name -contains 'PostponeUntilUtc')) {
+                $item | Add-Member -MemberType NoteProperty -Name PostponeUntilUtc -Value $null -Force
+            }
+            if (-not ($item.PSObject.Properties.Name -contains 'PostponeChoice')) {
+                $item | Add-Member -MemberType NoteProperty -Name PostponeChoice -Value $null -Force
+            }
+            if (-not ($item.PSObject.Properties.Name -contains 'ScheduledTaskName')) {
+                $item | Add-Member -MemberType NoteProperty -Name ScheduledTaskName -Value $null -Force
+            }
+        }
+
+        return @($queue.Browsers)
+    }
+    catch {
+        Write-LogEntry "Existing reload queue could not be read. Starting fresh. Error: $($_.Exception.Message)" "Warning"
+        return @()
     }
 }
 
@@ -585,21 +616,36 @@ function Save-ReloadQueue {
 function Add-OrUpdateQueueItem {
     param(
         [System.Collections.ArrayList]$Queue,
+        [array]$ExistingQueue,
         [string]$Browser,
         [string]$Reason
     )
 
-    $existing = $Queue | Where-Object { $_.Browser -eq $Browser } | Select-Object -First 1
-    if ($existing) {
-        $existing.Reason = $Reason
-        Write-LogEntry "$Browser already queued; updated reason"
+    $existingInNewQueue = $Queue | Where-Object { $_.Browser -eq $Browser } | Select-Object -First 1
+    if ($existingInNewQueue) {
+        $existingInNewQueue.Reason = $Reason
+        Write-LogEntry "$Browser already queued in current run; updated reason"
+        return
+    }
+
+    $existingSavedItem = $ExistingQueue | Where-Object { $_.Browser -eq $Browser } | Select-Object -First 1
+
+    if ($existingSavedItem) {
+        [void]$Queue.Add([PSCustomObject]@{
+            Browser           = $Browser
+            Reason            = $Reason
+            PostponeUntilUtc  = $existingSavedItem.PostponeUntilUtc
+            PostponeChoice    = $existingSavedItem.PostponeChoice
+            ScheduledTaskName = $existingSavedItem.ScheduledTaskName
+        })
+        Write-LogEntry "$Browser added to reload queue with preserved postpone state"
     }
     else {
         [void]$Queue.Add([PSCustomObject]@{
-            Browser = $Browser
-            Reason = $Reason
-            PostponeUntilUtc = $null
-            PostponeChoice = $null
+            Browser           = $Browser
+            Reason            = $Reason
+            PostponeUntilUtc  = $null
+            PostponeChoice    = $null
             ScheduledTaskName = $null
         })
         Write-LogEntry "$Browser added to reload queue"
@@ -613,6 +659,7 @@ try {
     Write-LogEntry "======================================"
 
     $tracking = Update-BrowserSessionTracking
+    $existingQueue = Get-ExistingReloadQueue
     $queue = [System.Collections.ArrayList]::new()
 
     $browserChecks = @(
@@ -639,7 +686,7 @@ try {
 
         if ($stateInfo.IsRunning) {
             if ($versionStatus.PendingUpdate) {
-                Add-OrUpdateQueueItem -Queue $queue -Browser $browser -Reason "Pending update and browser has been running continuously for at least 24 hours"
+                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason "Pending update and browser has been running continuously for at least 24 hours"
             }
             else {
                 Write-LogEntry "$browser is running for 24+ hours but no pending update was detected"
@@ -661,7 +708,7 @@ try {
 
             if ($needsNotification) {
                 $reason = "Browser has not been used for at least 24 hours and is " + ($reasonParts -join " and ")
-                Add-OrUpdateQueueItem -Queue $queue -Browser $browser -Reason $reason
+                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $reason
             }
             else {
                 Write-LogEntry "$browser has not been used for 24+ hours, but no pending update or confirmed out-of-date version was detected"
