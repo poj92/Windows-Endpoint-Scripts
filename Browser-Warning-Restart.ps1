@@ -1,7 +1,3 @@
-# PowerShell Script to Detect Browser Update Conditions and warnn 
-# users of pending updates with session/inactivity thresholds.
-# Script must be run as logged in user, not SYSTEM.
-
 #Requires -Version 5.1
 $ErrorActionPreference = 'Stop'
 
@@ -13,6 +9,7 @@ $LogFile = Join-Path $BasePath "Remediation.log"
 $TrackingFile = Join-Path $BasePath "BrowserUsageTracking.json"
 $QueueFile = Join-Path $BasePath "ReloadQueue.json"
 $WarningTimeSeconds = 300
+$CompanyName = "Nexus Open Systems Ltd"
 
 # =========================
 # Bootstrap
@@ -48,13 +45,42 @@ function Test-IsSystem {
     }
 }
 
+function Get-ExecutionContextInfo {
+    try {
+        $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+        $username = $identity.Name
+        $sid = $identity.User.Value
+        $sessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+        $processName = (Get-Process -Id $PID).ProcessName
+        Write-LogEntry "Execution context: User=$username | SID=$sid | SessionId=$sessionId | Process=$processName"
+    }
+    catch {
+        Write-LogEntry "Failed to collect execution context info: $($_.Exception.Message)" "Warning"
+    }
+}
+
 function Get-ReloadQueue {
     if (-not (Test-Path $QueueFile)) {
         return $null
     }
 
     try {
-        return (Get-Content -Path $QueueFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop)
+        $queue = Get-Content -Path $QueueFile -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+
+        if (-not ($queue.PSObject.Properties.Name -contains 'Browsers')) {
+            $queue | Add-Member -MemberType NoteProperty -Name Browsers -Value @() -Force
+        }
+
+        foreach ($item in $queue.Browsers) {
+            if (-not ($item.PSObject.Properties.Name -contains 'PostponeUntilUtc')) {
+                $item | Add-Member -MemberType NoteProperty -Name PostponeUntilUtc -Value $null -Force
+            }
+            if (-not ($item.PSObject.Properties.Name -contains 'PostponeChoice')) {
+                $item | Add-Member -MemberType NoteProperty -Name PostponeChoice -Value $null -Force
+            }
+        }
+
+        return $queue
     }
     catch {
         Write-LogEntry "Queue file is unreadable." "Error"
@@ -70,7 +96,7 @@ function Save-ReloadQueue {
         Browsers   = $Browsers
     }
 
-    $queue | ConvertTo-Json -Depth 5 | Set-Content -Path $QueueFile -Force -Encoding UTF8
+    $queue | ConvertTo-Json -Depth 6 | Set-Content -Path $QueueFile -Force -Encoding UTF8
 }
 
 function Get-BrowserUsageTracking {
@@ -122,7 +148,6 @@ function Get-BrowserUsageTracking {
 
 function Save-BrowserUsageTracking {
     param([object]$TrackingData)
-
     $TrackingData | ConvertTo-Json -Depth 5 | Set-Content -Path $TrackingFile -Force -Encoding UTF8
 }
 
@@ -150,66 +175,138 @@ function Get-FirefoxInstallPath {
 function Show-CountdownWarning {
     param(
         [string]$BrowserName,
-        [int]$CountdownSeconds
+        [int]$CountdownSeconds,
+        [string]$CompanyName
     )
 
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
+    try {
+        Write-LogEntry "Preparing popup for $BrowserName"
 
-    $script:Cancelled = $false
-    $script:SecondsLeft = $CountdownSeconds
+        Add-Type -AssemblyName System.Windows.Forms
+        Add-Type -AssemblyName System.Drawing
 
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = "$BrowserName update requires restart"
-    $form.Size = New-Object System.Drawing.Size(540,250)
-    $form.StartPosition = 'CenterScreen'
-    $form.TopMost = $true
-    $form.FormBorderStyle = 'FixedDialog'
-    $form.MaximizeBox = $false
-    $form.MinimizeBox = $false
+        $script:UserDecision = "Restart"
+        $script:SelectedPostponeMinutes = 60
+        $script:SecondsLeft = $CountdownSeconds
 
-    $label = New-Object System.Windows.Forms.Label
-    $label.Location = New-Object System.Drawing.Point(20,20)
-    $label.Size = New-Object System.Drawing.Size(490,70)
-    $label.Text = "$BrowserName has a pending update and has exceeded the allowed open/inactive time. It will be restarted automatically in:"
-    $label.Font = New-Object System.Drawing.Font('Segoe UI',10)
-    $form.Controls.Add($label)
+        $form = New-Object System.Windows.Forms.Form
+        $form.Text = "$CompanyName - $BrowserName restart required"
+        $form.Size = New-Object System.Drawing.Size(660,340)
+        $form.StartPosition = 'CenterScreen'
+        $form.TopMost = $true
+        $form.FormBorderStyle = 'FixedDialog'
+        $form.MaximizeBox = $false
+        $form.MinimizeBox = $false
+        $form.ShowInTaskbar = $true
 
-    $countdownLabel = New-Object System.Windows.Forms.Label
-    $countdownLabel.Location = New-Object System.Drawing.Point(20,90)
-    $countdownLabel.Size = New-Object System.Drawing.Size(490,40)
-    $countdownLabel.Font = New-Object System.Drawing.Font('Segoe UI',18,[System.Drawing.FontStyle]::Bold)
-    $countdownLabel.TextAlign = 'MiddleCenter'
-    $form.Controls.Add($countdownLabel)
+        $headerLabel = New-Object System.Windows.Forms.Label
+        $headerLabel.Location = New-Object System.Drawing.Point(20,20)
+        $headerLabel.Size = New-Object System.Drawing.Size(600,25)
+        $headerLabel.Text = "Message from $CompanyName"
+        $headerLabel.Font = New-Object System.Drawing.Font('Segoe UI',11,[System.Drawing.FontStyle]::Bold)
+        $form.Controls.Add($headerLabel)
 
-    $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Location = New-Object System.Drawing.Point(185,150)
-    $cancelButton.Size = New-Object System.Drawing.Size(160,35)
-    $cancelButton.Text = 'Cancel Restart'
-    $cancelButton.Add_Click({
-        $script:Cancelled = $true
-        $form.Close()
-    })
-    $form.Controls.Add($cancelButton)
+        $label = New-Object System.Windows.Forms.Label
+        $label.Location = New-Object System.Drawing.Point(20,55)
+        $label.Size = New-Object System.Drawing.Size(600,70)
+        $label.Text = "$CompanyName needs to restart $BrowserName to complete a pending security and stability update. The restart will happen automatically in:"
+        $label.Font = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($label)
 
-    $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 1000
-    $timer.Add_Tick({
-        $minutes = [math]::Floor($script:SecondsLeft / 60)
-        $seconds = $script:SecondsLeft % 60
-        $countdownLabel.Text = "{0}:{1:D2}" -f $minutes, $seconds
-        $script:SecondsLeft--
+        $countdownLabel = New-Object System.Windows.Forms.Label
+        $countdownLabel.Location = New-Object System.Drawing.Point(20,125)
+        $countdownLabel.Size = New-Object System.Drawing.Size(600,40)
+        $countdownLabel.Font = New-Object System.Drawing.Font('Segoe UI',18,[System.Drawing.FontStyle]::Bold)
+        $countdownLabel.TextAlign = 'MiddleCenter'
+        $form.Controls.Add($countdownLabel)
 
-        if ($script:SecondsLeft -lt 0) {
-            $timer.Stop()
+        $postponeLabel = New-Object System.Windows.Forms.Label
+        $postponeLabel.Location = New-Object System.Drawing.Point(120,185)
+        $postponeLabel.Size = New-Object System.Drawing.Size(180,25)
+        $postponeLabel.Text = "Postpone restart for:"
+        $postponeLabel.Font = New-Object System.Drawing.Font('Segoe UI',10)
+        $form.Controls.Add($postponeLabel)
+
+        $comboBox = New-Object System.Windows.Forms.ComboBox
+        $comboBox.Location = New-Object System.Drawing.Point(305,182)
+        $comboBox.Size = New-Object System.Drawing.Size(180,25)
+        $comboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        [void]$comboBox.Items.Add("30 minutes")
+        [void]$comboBox.Items.Add("1 hour")
+        [void]$comboBox.Items.Add("2 hours")
+        [void]$comboBox.Items.Add("4 hours")
+        $comboBox.SelectedIndex = 1
+        $form.Controls.Add($comboBox)
+
+        $restartNowButton = New-Object System.Windows.Forms.Button
+        $restartNowButton.Location = New-Object System.Drawing.Point(150,235)
+        $restartNowButton.Size = New-Object System.Drawing.Size(140,35)
+        $restartNowButton.Text = 'Restart Now'
+        $restartNowButton.Add_Click({
+            $script:UserDecision = "RestartNow"
             $form.Close()
+        })
+        $form.Controls.Add($restartNowButton)
+
+        $postponeButton = New-Object System.Windows.Forms.Button
+        $postponeButton.Location = New-Object System.Drawing.Point(330,235)
+        $postponeButton.Size = New-Object System.Drawing.Size(160,35)
+        $postponeButton.Text = 'Postpone Restart'
+        $postponeButton.Add_Click({
+            switch ($comboBox.SelectedItem) {
+                "30 minutes" { $script:SelectedPostponeMinutes = 30 }
+                "1 hour"     { $script:SelectedPostponeMinutes = 60 }
+                "2 hours"    { $script:SelectedPostponeMinutes = 120 }
+                "4 hours"    { $script:SelectedPostponeMinutes = 240 }
+                default      { $script:SelectedPostponeMinutes = 60 }
+            }
+            $script:UserDecision = "Postpone"
+            $form.Close()
+        })
+        $form.Controls.Add($postponeButton)
+
+        $footerLabel = New-Object System.Windows.Forms.Label
+        $footerLabel.Location = New-Object System.Drawing.Point(20,285)
+        $footerLabel.Size = New-Object System.Drawing.Size(600,20)
+        $footerLabel.Text = "You can restart now or postpone this restart for a limited time."
+        $footerLabel.Font = New-Object System.Drawing.Font('Segoe UI',9)
+        $form.Controls.Add($footerLabel)
+
+        $timer = New-Object System.Windows.Forms.Timer
+        $timer.Interval = 1000
+        $timer.Add_Tick({
+            $minutes = [math]::Floor($script:SecondsLeft / 60)
+            $seconds = $script:SecondsLeft % 60
+            $countdownLabel.Text = "{0}:{1:D2}" -f $minutes, $seconds
+            $script:SecondsLeft--
+
+            if ($script:SecondsLeft -lt 0) {
+                $timer.Stop()
+                $script:UserDecision = "CountdownRestart"
+                $form.Close()
+            }
+        })
+
+        $form.Add_Shown({
+            Write-LogEntry "Popup shown for $BrowserName"
+            $form.Activate()
+        })
+
+        $timer.Start()
+        [void]$form.ShowDialog()
+
+        return [PSCustomObject]@{
+            Action = $script:UserDecision
+            PostponeMinutes = $script:SelectedPostponeMinutes
         }
-    })
-
-    $timer.Start()
-    [void]$form.ShowDialog()
-
-    return (-not $script:Cancelled)
+    }
+    catch {
+        Write-LogEntry "Popup failed for $BrowserName : $($_.Exception.Message)" "Error"
+        return [PSCustomObject]@{
+            Action = "Restart"
+            PostponeMinutes = 60
+        }
+    }
 }
 
 function Invoke-BrowserReload {
@@ -223,29 +320,24 @@ function Invoke-BrowserReload {
             "Chrome" {
                 $exe = Get-ChromeInstallPath
                 if (-not $exe) { throw "Chrome executable not found" }
-
                 Get-Process chrome -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
                 Start-Sleep -Seconds 10
                 Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 2
                 Start-Process -FilePath $exe | Out-Null
             }
-
             "Firefox" {
                 $exe = Get-FirefoxInstallPath
                 if (-not $exe) { throw "Firefox executable not found" }
-
                 Get-Process firefox -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
                 Start-Sleep -Seconds 10
                 Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
                 Start-Sleep -Seconds 2
                 Start-Process -FilePath $exe | Out-Null
             }
-
             "Edge" {
                 $exe = Get-EdgeInstallPath
                 if (-not $exe) { throw "Edge executable not found" }
-
                 Get-Process msedge -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
                 Start-Sleep -Seconds 10
                 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
@@ -268,6 +360,8 @@ try {
     Write-LogEntry "Browser reload remediation started"
     Write-LogEntry "======================================"
 
+    Get-ExecutionContextInfo
+
     if (Test-IsSystem) {
         Write-LogEntry "Remediation script is running as SYSTEM. This script must run as the logged-in user." "Error"
         exit 2
@@ -282,15 +376,44 @@ try {
     Write-LogEntry "Found $($queue.Browsers.Count) queued browser(s) for restart"
 
     $remainingQueue = @()
+    $nowUtc = (Get-Date).ToUniversalTime()
 
     foreach ($item in $queue.Browsers) {
         $browser = $item.Browser
+
+        if (-not ($item.PSObject.Properties.Name -contains 'PostponeUntilUtc')) {
+            $item | Add-Member -MemberType NoteProperty -Name PostponeUntilUtc -Value $null -Force
+        }
+        if (-not ($item.PSObject.Properties.Name -contains 'PostponeChoice')) {
+            $item | Add-Member -MemberType NoteProperty -Name PostponeChoice -Value $null -Force
+        }
+
+        if ($item.PostponeUntilUtc) {
+            try {
+                $postponeUntil = [datetime]::Parse($item.PostponeUntilUtc).ToUniversalTime()
+                if ($postponeUntil -gt $nowUtc) {
+                    Write-LogEntry "$browser is postponed until $($postponeUntil.ToString("o")); skipping for now"
+                    $remainingQueue += $item
+                    continue
+                }
+            }
+            catch {
+                Write-LogEntry "Invalid PostponeUntilUtc for $browser; ignoring postpone value" "Warning"
+                $item.PostponeUntilUtc = $null
+                $item.PostponeChoice = $null
+            }
+        }
+
         Write-LogEntry "Processing $browser. Reason: $($item.Reason)"
+        Write-LogEntry "Displaying popup for $browser with $WarningTimeSeconds second countdown"
 
-        $proceed = Show-CountdownWarning -BrowserName $browser -CountdownSeconds $WarningTimeSeconds
+        $decision = Show-CountdownWarning -BrowserName $browser -CountdownSeconds $WarningTimeSeconds -CompanyName $CompanyName
+        Write-LogEntry "Popup closed for $browser. Action=$($decision.Action) PostponeMinutes=$($decision.PostponeMinutes)"
 
-        if (-not $proceed) {
-            Write-LogEntry "$browser restart cancelled by user" "Warning"
+        if ($decision.Action -eq "Postpone") {
+            $item.PostponeUntilUtc = (Get-Date).ToUniversalTime().AddMinutes([int]$decision.PostponeMinutes).ToString("o")
+            $item.PostponeChoice = "$($decision.PostponeMinutes) minutes"
+            Write-LogEntry "$browser postponed until $($item.PostponeUntilUtc) ($($item.PostponeChoice))"
             $remainingQueue += $item
             continue
         }
