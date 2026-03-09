@@ -9,6 +9,7 @@ $LogFile = Join-Path $BasePath "Detection.log"
 $TrackingFile = Join-Path $BasePath "BrowserUsageTracking.json"
 $QueueFile = Join-Path $BasePath "ReloadQueue.json"
 $BrowserReloadThresholdHours = 24
+$ApiTimeoutSeconds = 20
 
 # =========================
 # Bootstrap
@@ -36,7 +37,7 @@ function Write-LogEntry {
 }
 
 function New-BrowserUsageTracking {
-    return [PSCustomObject]@{
+    [PSCustomObject]@{
         Chrome  = [PSCustomObject]@{ LastStart = $null; LastStop = $null; IsRunning = $false }
         Firefox = [PSCustomObject]@{ LastStart = $null; LastStop = $null; IsRunning = $false }
         Edge    = [PSCustomObject]@{ LastStart = $null; LastStop = $null; IsRunning = $false }
@@ -109,22 +110,18 @@ function Get-BrowserEarliestStartTime {
 
     try {
         $procs = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
-
         if (-not $procs) {
             return $null
         }
 
         $startTimes = @()
-
         foreach ($proc in $procs) {
             try {
                 if ($proc.StartTime) {
                     $startTimes += $proc.StartTime
                 }
             }
-            catch {
-                # Ignore any process where StartTime can't be read
-            }
+            catch {}
         }
 
         if ($startTimes.Count -gt 0) {
@@ -154,16 +151,6 @@ function Update-BrowserSessionTracking {
         $procs = Get-Process -Name $procName -ErrorAction SilentlyContinue
         $isRunningNow = [bool]$procs
 
-        if (-not ($tracking.$browser.PSObject.Properties.Name -contains 'LastStart')) {
-            Add-Member -InputObject $tracking.$browser -MemberType NoteProperty -Name LastStart -Value $null -Force
-        }
-        if (-not ($tracking.$browser.PSObject.Properties.Name -contains 'LastStop')) {
-            Add-Member -InputObject $tracking.$browser -MemberType NoteProperty -Name LastStop -Value $null -Force
-        }
-        if (-not ($tracking.$browser.PSObject.Properties.Name -contains 'IsRunning')) {
-            Add-Member -InputObject $tracking.$browser -MemberType NoteProperty -Name IsRunning -Value $false -Force
-        }
-
         if ($isRunningNow) {
             $actualStart = Get-BrowserEarliestStartTime -ProcessName $procName
 
@@ -175,11 +162,9 @@ function Update-BrowserSessionTracking {
                     $tracking.$browser.IsRunning = $true
                     Write-LogEntry "$browser is running. Actual process start time detected as $actualStartIso"
                 }
-                else {
-                    if ($tracking.$browser.LastStart -ne $actualStartIso) {
-                        $tracking.$browser.LastStart = $actualStartIso
-                        Write-LogEntry "$browser running session start time corrected to actual process start time $actualStartIso"
-                    }
+                elseif ($tracking.$browser.LastStart -ne $actualStartIso) {
+                    $tracking.$browser.LastStart = $actualStartIso
+                    Write-LogEntry "$browser running session start time corrected to actual process start time $actualStartIso"
                 }
             }
             else {
@@ -203,7 +188,7 @@ function Update-BrowserSessionTracking {
     return $tracking
 }
 
-function Test-BrowserSessionAge {
+function Get-BrowserStateInfo {
     param(
         [string]$BrowserName,
         [object]$TrackingData,
@@ -216,36 +201,68 @@ function Test-BrowserSessionAge {
     if ([bool]$state.IsRunning) {
         if ([string]::IsNullOrWhiteSpace($state.LastStart)) {
             Write-LogEntry "$BrowserName is running but LastStart is unknown. Skipping on this pass." "Warning"
-            return $false
+            return [PSCustomObject]@{
+                IsRunning = $true
+                Hours = 0
+                ThresholdMet = $false
+                Condition = "Running"
+            }
         }
 
         $started = [datetime]::Parse($state.LastStart)
         $age = $now - $started
+        $hours = [math]::Round($age.TotalHours, 2)
 
         if ($age.TotalHours -ge $ThresholdHours) {
-            Write-LogEntry "$BrowserName has been running continuously for $([math]::Round($age.TotalHours,2)) hours, which meets the threshold"
-            return $true
+            Write-LogEntry "$BrowserName has been running continuously for $hours hours, which meets the threshold"
+            return [PSCustomObject]@{
+                IsRunning = $true
+                Hours = $hours
+                ThresholdMet = $true
+                Condition = "Running"
+            }
         }
 
-        Write-LogEntry "$BrowserName has been running for $([math]::Round($age.TotalHours,2)) hours"
-        return $false
+        Write-LogEntry "$BrowserName has been running for $hours hours"
+        return [PSCustomObject]@{
+            IsRunning = $true
+            Hours = $hours
+            ThresholdMet = $false
+            Condition = "Running"
+        }
     }
 
     if ([string]::IsNullOrWhiteSpace($state.LastStop)) {
         Write-LogEntry "$BrowserName has not yet recorded a LastStop. Skipping on this pass."
-        return $false
+        return [PSCustomObject]@{
+            IsRunning = $false
+            Hours = 0
+            ThresholdMet = $false
+            Condition = "Closed"
+        }
     }
 
     $stopped = [datetime]::Parse($state.LastStop)
     $inactive = $now - $stopped
+    $hoursClosed = [math]::Round($inactive.TotalHours, 2)
 
     if ($inactive.TotalHours -ge $ThresholdHours) {
-        Write-LogEntry "$BrowserName has been observed closed for $([math]::Round($inactive.TotalHours,2)) hours, which meets the threshold"
-        return $true
+        Write-LogEntry "$BrowserName has been observed closed for $hoursClosed hours, which meets the threshold"
+        return [PSCustomObject]@{
+            IsRunning = $false
+            Hours = $hoursClosed
+            ThresholdMet = $true
+            Condition = "Closed"
+        }
     }
 
-    Write-LogEntry "$BrowserName has been observed closed for $([math]::Round($inactive.TotalHours,2)) hours"
-    return $false
+    Write-LogEntry "$BrowserName has been observed closed for $hoursClosed hours"
+    return [PSCustomObject]@{
+        IsRunning = $false
+        Hours = $hoursClosed
+        ThresholdMet = $false
+        Condition = "Closed"
+    }
 }
 
 function Get-ChromeInstallPath {
@@ -269,10 +286,120 @@ function Get-FirefoxInstallPath {
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
 }
 
+function Get-ChromeVersion {
+    try {
+        $path = "HKLM:\SOFTWARE\Google\Chrome\BLBeacon"
+        if (Test-Path $path) {
+            return (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue).version
+        }
+    }
+    catch {
+        Write-LogEntry "Error reading Chrome installed version: $($_.Exception.Message)" "Warning"
+    }
+    return $null
+}
+
+function Get-EdgeVersion {
+    try {
+        $path = "HKLM:\SOFTWARE\Microsoft\Edge\BLBeacon"
+        if (Test-Path $path) {
+            return (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue).version
+        }
+    }
+    catch {
+        Write-LogEntry "Error reading Edge installed version: $($_.Exception.Message)" "Warning"
+    }
+    return $null
+}
+
+function Get-FirefoxVersion {
+    try {
+        $path = "HKLM:\SOFTWARE\Mozilla\Mozilla Firefox"
+        if (Test-Path $path) {
+            return (Get-ItemProperty -Path $path -ErrorAction SilentlyContinue)."CurrentVersion"
+        }
+    }
+    catch {
+        Write-LogEntry "Error reading Firefox installed version: $($_.Exception.Message)" "Warning"
+    }
+    return $null
+}
+
+function Compare-VersionNewer {
+    param(
+        [string]$Installed,
+        [string]$Latest
+    )
+
+    try {
+        if ([string]::IsNullOrWhiteSpace($Installed) -or [string]::IsNullOrWhiteSpace($Latest)) {
+            return $null
+        }
+
+        return ([version]$Latest -gt [version]$Installed)
+    }
+    catch {
+        Write-LogEntry "Version comparison failed. Installed='$Installed' Latest='$Latest'" "Warning"
+        return $null
+    }
+}
+
+function Get-LatestChromeVersion {
+    try {
+        $uri = "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions?pageSize=1"
+        $response = Invoke-RestMethod -Uri $uri -TimeoutSec $ApiTimeoutSeconds -ErrorAction Stop
+        if ($response.versions -and $response.versions.Count -gt 0) {
+            return $response.versions[0].version
+        }
+    }
+    catch {
+        Write-LogEntry "Unable to fetch latest Chrome version: $($_.Exception.Message)" "Warning"
+    }
+    return $null
+}
+
+function Get-LatestFirefoxVersion {
+    try {
+        $uri = "https://product-details.mozilla.org/1.0/firefox_versions.json"
+        $response = Invoke-RestMethod -Uri $uri -TimeoutSec $ApiTimeoutSeconds -ErrorAction Stop
+        if ($response.LATEST_FIREFOX_VERSION) {
+            return $response.LATEST_FIREFOX_VERSION
+        }
+    }
+    catch {
+        Write-LogEntry "Unable to fetch latest Firefox version: $($_.Exception.Message)" "Warning"
+    }
+    return $null
+}
+
+function Get-LatestEdgeVersion {
+    try {
+        $uri = "https://edgeupdates.microsoft.com/api/products?view=enterprise"
+        $response = Invoke-RestMethod -Uri $uri -TimeoutSec $ApiTimeoutSeconds -ErrorAction Stop
+
+        foreach ($product in $response) {
+            if ($product.Product -eq "Stable") {
+                $release = $product.Releases | Sort-Object {
+                    try { [version]$_.ProductVersion } catch { [version]"0.0.0.0" }
+                } -Descending | Select-Object -First 1
+
+                if ($release -and $release.ProductVersion) {
+                    return $release.ProductVersion
+                }
+            }
+        }
+    }
+    catch {
+        Write-LogEntry "Unable to fetch latest Edge version: $($_.Exception.Message)" "Warning"
+    }
+    return $null
+}
+
 function Test-ChromePendingUpdate {
     try {
         $chromeVersion = $null
         $chromeRegPath = "HKLM:\SOFTWARE\Google\Chrome\BLBeacon"
+
         if (Test-Path $chromeRegPath) {
             $chromeVersion = (Get-ItemProperty -Path $chromeRegPath -ErrorAction SilentlyContinue).version
         }
@@ -406,6 +533,44 @@ function Test-FirefoxPendingUpdate {
     }
 }
 
+function Get-BrowserVersionStatus {
+    param(
+        [ValidateSet("Chrome","Firefox","Edge")]
+        [string]$BrowserName
+    )
+
+    switch ($BrowserName) {
+        "Chrome" {
+            $installed = Get-ChromeVersion
+            $latest = Get-LatestChromeVersion
+            $pending = Test-ChromePendingUpdate
+        }
+        "Firefox" {
+            $installed = Get-FirefoxVersion
+            $latest = Get-LatestFirefoxVersion
+            $pending = Test-FirefoxPendingUpdate
+        }
+        "Edge" {
+            $installed = Get-EdgeVersion
+            $latest = Get-LatestEdgeVersion
+            $pending = Test-EdgePendingUpdate
+        }
+    }
+
+    $outOfDate = Compare-VersionNewer -Installed $installed -Latest $latest
+
+    $upToDateText = if ($null -eq $outOfDate) { "Unknown" } elseif (-not $outOfDate) { "Yes" } else { "No" }
+    Write-LogEntry "$BrowserName version status: Installed=$installed | Latest=$latest | UpToDate=$upToDateText | PendingUpdate=$pending"
+
+    [PSCustomObject]@{
+        Browser = $BrowserName
+        Installed = $installed
+        Latest = $latest
+        OutOfDate = $outOfDate
+        PendingUpdate = $pending
+    }
+}
+
 function Save-ReloadQueue {
     param([array]$Browsers)
 
@@ -414,7 +579,31 @@ function Save-ReloadQueue {
         Browsers   = $Browsers
     }
 
-    $queue | ConvertTo-Json -Depth 5 | Set-Content -Path $QueueFile -Force -Encoding UTF8
+    $queue | ConvertTo-Json -Depth 8 | Set-Content -Path $QueueFile -Force -Encoding UTF8
+}
+
+function Add-OrUpdateQueueItem {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [string]$Browser,
+        [string]$Reason
+    )
+
+    $existing = $Queue | Where-Object { $_.Browser -eq $Browser } | Select-Object -First 1
+    if ($existing) {
+        $existing.Reason = $Reason
+        Write-LogEntry "$Browser already queued; updated reason"
+    }
+    else {
+        [void]$Queue.Add([PSCustomObject]@{
+            Browser = $Browser
+            Reason = $Reason
+            PostponeUntilUtc = $null
+            PostponeChoice = $null
+            ScheduledTaskName = $null
+        })
+        Write-LogEntry "$Browser added to reload queue"
+    }
 }
 
 try {
@@ -424,41 +613,59 @@ try {
     Write-LogEntry "======================================"
 
     $tracking = Update-BrowserSessionTracking
-    $queue = @()
+    $queue = [System.Collections.ArrayList]::new()
 
-    if (Get-ChromeInstallPath) {
-        Write-LogEntry "Evaluating Chrome"
-        if ((Test-BrowserSessionAge -BrowserName "Chrome" -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours) -and
-            (Test-ChromePendingUpdate)) {
-            $queue += [PSCustomObject]@{
-                Browser = "Chrome"
-                Reason  = "Pending update and 24-hour browser reload threshold exceeded"
-            }
-            Write-LogEntry "Chrome added to reload queue"
+    $browserChecks = @(
+        [PSCustomObject]@{ Name = "Chrome";  Present = [bool](Get-ChromeInstallPath)  }
+        [PSCustomObject]@{ Name = "Firefox"; Present = [bool](Get-FirefoxInstallPath) }
+        [PSCustomObject]@{ Name = "Edge";    Present = [bool](Get-EdgeInstallPath)    }
+    )
+
+    foreach ($browserCheck in $browserChecks) {
+        if (-not $browserCheck.Present) {
+            continue
         }
-    }
 
-    if (Get-FirefoxInstallPath) {
-        Write-LogEntry "Evaluating Firefox"
-        if ((Test-BrowserSessionAge -BrowserName "Firefox" -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours) -and
-            (Test-FirefoxPendingUpdate)) {
-            $queue += [PSCustomObject]@{
-                Browser = "Firefox"
-                Reason  = "Pending update and 24-hour browser reload threshold exceeded"
-            }
-            Write-LogEntry "Firefox added to reload queue"
+        $browser = $browserCheck.Name
+        Write-LogEntry "Evaluating $browser"
+
+        $stateInfo = Get-BrowserStateInfo -BrowserName $browser -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours
+        $versionStatus = Get-BrowserVersionStatus -BrowserName $browser
+
+        if (-not $stateInfo.ThresholdMet) {
+            Write-LogEntry "$browser does not meet the $BrowserReloadThresholdHours-hour threshold"
+            continue
         }
-    }
 
-    if (Get-EdgeInstallPath) {
-        Write-LogEntry "Evaluating Edge"
-        if ((Test-BrowserSessionAge -BrowserName "Edge" -TrackingData $tracking -ThresholdHours $BrowserReloadThresholdHours) -and
-            (Test-EdgePendingUpdate)) {
-            $queue += [PSCustomObject]@{
-                Browser = "Edge"
-                Reason  = "Pending update and 24-hour browser reload threshold exceeded"
+        if ($stateInfo.IsRunning) {
+            if ($versionStatus.PendingUpdate) {
+                Add-OrUpdateQueueItem -Queue $queue -Browser $browser -Reason "Pending update and browser has been running continuously for at least 24 hours"
             }
-            Write-LogEntry "Edge added to reload queue"
+            else {
+                Write-LogEntry "$browser is running for 24+ hours but no pending update was detected"
+            }
+        }
+        else {
+            $needsNotification = $false
+            $reasonParts = @()
+
+            if ($versionStatus.PendingUpdate) {
+                $needsNotification = $true
+                $reasonParts += "pending update"
+            }
+
+            if ($versionStatus.OutOfDate -eq $true) {
+                $needsNotification = $true
+                $reasonParts += "out of date"
+            }
+
+            if ($needsNotification) {
+                $reason = "Browser has not been used for at least 24 hours and is " + ($reasonParts -join " and ")
+                Add-OrUpdateQueueItem -Queue $queue -Browser $browser -Reason $reason
+            }
+            else {
+                Write-LogEntry "$browser has not been used for 24+ hours, but no pending update or confirmed out-of-date version was detected"
+            }
         }
     }
 

@@ -1,4 +1,8 @@
 #Requires -Version 5.1
+param(
+    [string]$ScheduledTaskName
+)
+
 $ErrorActionPreference = 'Stop'
 
 # =========================
@@ -10,6 +14,7 @@ $TrackingFile = Join-Path $BasePath "BrowserUsageTracking.json"
 $QueueFile = Join-Path $BasePath "ReloadQueue.json"
 $WarningTimeSeconds = 300
 $CompanyName = "Nexus Open Systems Ltd"
+$RemediationScriptPath = "C:\ProgramData\Datto\BrowserUpdateCheck\BrowserReloadRemediation.ps1"
 
 # =========================
 # Bootstrap
@@ -36,6 +41,52 @@ function Write-LogEntry {
     Write-Host $line
 }
 
+function Save-CurrentScriptToStablePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    try {
+        $currentScriptPath = $PSCommandPath
+
+        if ([string]::IsNullOrWhiteSpace($currentScriptPath) -or -not (Test-Path $currentScriptPath)) {
+            throw "Unable to determine current script path."
+        }
+
+        $destinationFolder = Split-Path -Path $DestinationPath -Parent
+        if (-not (Test-Path $destinationFolder)) {
+            New-Item -Path $destinationFolder -ItemType Directory -Force | Out-Null
+        }
+
+        Copy-Item -Path $currentScriptPath -Destination $DestinationPath -Force
+        Write-LogEntry "Copied remediation script from '$currentScriptPath' to '$DestinationPath'"
+        return $true
+    }
+    catch {
+        Write-LogEntry "Failed to copy remediation script to stable path: $($_.Exception.Message)" "Error"
+        return $false
+    }
+}
+
+function Remove-ScheduledTaskIfRequested {
+    param(
+        [string]$TaskName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TaskName)) {
+        return
+    }
+
+    try {
+        cmd.exe /c "schtasks /Delete /TN `"$TaskName`" /F" 1>$null 2>$null | Out-Null
+        Write-LogEntry "Deleted scheduled task '$TaskName' after launch"
+    }
+    catch {
+        Write-LogEntry "Failed to delete scheduled task '$TaskName' : $($_.Exception.Message)" "Warning"
+    }
+}
+
 function Test-IsSystem {
     try {
         return ([System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value -eq 'S-1-5-18')
@@ -59,6 +110,38 @@ function Get-ExecutionContextInfo {
     }
 }
 
+function Get-CurrentUserSam {
+    try {
+        return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    }
+    catch {
+        return $env:USERNAME
+    }
+}
+
+function Get-BrowserProcessName {
+    param(
+        [ValidateSet("Chrome","Firefox","Edge")]
+        [string]$BrowserName
+    )
+
+    switch ($BrowserName) {
+        "Chrome"  { return "chrome" }
+        "Firefox" { return "firefox" }
+        "Edge"    { return "msedge" }
+    }
+}
+
+function Test-BrowserRunning {
+    param(
+        [ValidateSet("Chrome","Firefox","Edge")]
+        [string]$BrowserName
+    )
+
+    $processName = Get-BrowserProcessName -BrowserName $BrowserName
+    return [bool](Get-Process -Name $processName -ErrorAction SilentlyContinue)
+}
+
 function Get-ReloadQueue {
     if (-not (Test-Path $QueueFile)) {
         return $null
@@ -78,6 +161,9 @@ function Get-ReloadQueue {
             if (-not ($item.PSObject.Properties.Name -contains 'PostponeChoice')) {
                 $item | Add-Member -MemberType NoteProperty -Name PostponeChoice -Value $null -Force
             }
+            if (-not ($item.PSObject.Properties.Name -contains 'ScheduledTaskName')) {
+                $item | Add-Member -MemberType NoteProperty -Name ScheduledTaskName -Value $null -Force
+            }
         }
 
         return $queue
@@ -96,7 +182,7 @@ function Save-ReloadQueue {
         Browsers   = $Browsers
     }
 
-    $queue | ConvertTo-Json -Depth 6 | Set-Content -Path $QueueFile -Force -Encoding UTF8
+    $queue | ConvertTo-Json -Depth 8 | Set-Content -Path $QueueFile -Force -Encoding UTF8
 }
 
 function Get-BrowserUsageTracking {
@@ -170,6 +256,63 @@ function Get-FirefoxInstallPath {
         "C:\Program Files\Mozilla Firefox\firefox.exe",
         "C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
     ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+function Get-BrowserExecutablePath {
+    param(
+        [ValidateSet("Chrome","Firefox","Edge")]
+        [string]$BrowserName
+    )
+
+    switch ($BrowserName) {
+        "Chrome"  { return (Get-ChromeInstallPath) }
+        "Firefox" { return (Get-FirefoxInstallPath) }
+        "Edge"    { return (Get-EdgeInstallPath) }
+    }
+}
+
+function New-UniqueTaskName {
+    param(
+        [ValidateSet("Chrome","Firefox","Edge")]
+        [string]$BrowserName
+    )
+
+    return "NexusBrowserReload_{0}_{1}" -f $BrowserName, ([guid]::NewGuid().ToString("N").Substring(0,8))
+}
+
+function Register-PostponeScheduledTask {
+    param(
+        [ValidateSet("Chrome","Firefox","Edge")]
+        [string]$BrowserName,
+        [datetime]$RunAtLocal,
+        [string]$ScriptPath
+    )
+
+    try {
+        if (-not (Test-Path $ScriptPath)) {
+            throw "Remediation script path not found: $ScriptPath"
+        }
+
+        $taskName = New-UniqueTaskName -BrowserName $BrowserName
+        $taskTime = $RunAtLocal.ToString("HH:mm")
+        $taskDate = $RunAtLocal.ToString("MM/dd/yyyy")
+        $currentUser = Get-CurrentUserSam
+
+        $taskCommand = "powershell.exe -ExecutionPolicy Bypass -WindowStyle Normal -File `"$ScriptPath`" -ScheduledTaskName `"$taskName`""
+        $createCmd = "schtasks /Create /TN `"$taskName`" /TR `"$taskCommand`" /SC ONCE /SD $taskDate /ST $taskTime /RU `"$currentUser`" /IT /F"
+        $result = cmd.exe /c $createCmd 2>&1
+
+        if ($LASTEXITCODE -ne 0) {
+            throw "schtasks returned exit code $LASTEXITCODE. Output: $($result -join ' ')"
+        }
+
+        Write-LogEntry "Scheduled task '$taskName' created for $BrowserName at $($RunAtLocal.ToString('yyyy-MM-dd HH:mm:ss')) as $currentUser"
+        return $taskName
+    }
+    catch {
+        Write-LogEntry "Failed to create scheduled task for $BrowserName : $($_.Exception.Message)" "Error"
+        return $null
+    }
 }
 
 function Show-CountdownWarning {
@@ -296,14 +439,14 @@ function Show-CountdownWarning {
         [void]$form.ShowDialog()
 
         return [PSCustomObject]@{
-            Action = $script:UserDecision
+            Action          = $script:UserDecision
             PostponeMinutes = $script:SelectedPostponeMinutes
         }
     }
     catch {
         Write-LogEntry "Popup failed for $BrowserName : $($_.Exception.Message)" "Error"
         return [PSCustomObject]@{
-            Action = "Restart"
+            Action          = "Restart"
             PostponeMinutes = 60
         }
     }
@@ -316,38 +459,45 @@ function Invoke-BrowserReload {
     )
 
     try {
-        switch ($BrowserName) {
-            "Chrome" {
-                $exe = Get-ChromeInstallPath
-                if (-not $exe) { throw "Chrome executable not found" }
-                Get-Process chrome -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
-                Start-Sleep -Seconds 10
-                Get-Process chrome -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-                Start-Process -FilePath $exe | Out-Null
-            }
-            "Firefox" {
-                $exe = Get-FirefoxInstallPath
-                if (-not $exe) { throw "Firefox executable not found" }
-                Get-Process firefox -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
-                Start-Sleep -Seconds 10
-                Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-                Start-Process -FilePath $exe | Out-Null
-            }
-            "Edge" {
-                $exe = Get-EdgeInstallPath
-                if (-not $exe) { throw "Edge executable not found" }
-                Get-Process msedge -ErrorAction SilentlyContinue | ForEach-Object { $_.CloseMainWindow() | Out-Null }
-                Start-Sleep -Seconds 10
-                Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Seconds 2
-                Start-Process -FilePath $exe | Out-Null
-            }
+        $exe = Get-BrowserExecutablePath -BrowserName $BrowserName
+        if (-not $exe) {
+            throw "$BrowserName executable not found"
         }
 
-        Write-LogEntry "$BrowserName restarted successfully"
-        return $true
+        $processName = Get-BrowserProcessName -BrowserName $BrowserName
+
+        if (-not (Test-BrowserRunning -BrowserName $BrowserName)) {
+            Write-LogEntry "$BrowserName is no longer running. Marking queue item complete without restart."
+            return $true
+        }
+
+        Write-LogEntry "Attempting graceful close of $BrowserName processes"
+        Get-Process -Name $processName -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $_.CloseMainWindow() | Out-Null
+            }
+            catch {}
+        }
+
+        Start-Sleep -Seconds 10
+
+        if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+            Write-LogEntry "$BrowserName still has running processes after graceful close; forcing termination" "Warning"
+            Get-Process -Name $processName -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+        }
+
+        Write-LogEntry "Starting $BrowserName from '$exe'"
+        Start-Process -FilePath $exe | Out-Null
+
+        Start-Sleep -Seconds 2
+
+        if (Test-BrowserRunning -BrowserName $BrowserName) {
+            Write-LogEntry "$BrowserName restarted successfully"
+            return $true
+        }
+
+        throw "$BrowserName did not appear to restart successfully"
     }
     catch {
         Write-LogEntry "$BrowserName restart failed: $($_.Exception.Message)" "Error"
@@ -361,6 +511,11 @@ try {
     Write-LogEntry "======================================"
 
     Get-ExecutionContextInfo
+    Remove-ScheduledTaskIfRequested -TaskName $ScheduledTaskName
+
+    if (-not (Save-CurrentScriptToStablePath -DestinationPath $RemediationScriptPath)) {
+        Write-LogEntry "Continuing, but postponed scheduled tasks may fail because the stable script copy is missing." "Warning"
+    }
 
     if (Test-IsSystem) {
         Write-LogEntry "Remediation script is running as SYSTEM. This script must run as the logged-in user." "Error"
@@ -387,6 +542,9 @@ try {
         if (-not ($item.PSObject.Properties.Name -contains 'PostponeChoice')) {
             $item | Add-Member -MemberType NoteProperty -Name PostponeChoice -Value $null -Force
         }
+        if (-not ($item.PSObject.Properties.Name -contains 'ScheduledTaskName')) {
+            $item | Add-Member -MemberType NoteProperty -Name ScheduledTaskName -Value $null -Force
+        }
 
         if ($item.PostponeUntilUtc) {
             try {
@@ -401,6 +559,7 @@ try {
                 Write-LogEntry "Invalid PostponeUntilUtc for $browser; ignoring postpone value" "Warning"
                 $item.PostponeUntilUtc = $null
                 $item.PostponeChoice = $null
+                $item.ScheduledTaskName = $null
             }
         }
 
@@ -411,9 +570,20 @@ try {
         Write-LogEntry "Popup closed for $browser. Action=$($decision.Action) PostponeMinutes=$($decision.PostponeMinutes)"
 
         if ($decision.Action -eq "Postpone") {
-            $item.PostponeUntilUtc = (Get-Date).ToUniversalTime().AddMinutes([int]$decision.PostponeMinutes).ToString("o")
+            $runAtLocal = (Get-Date).AddMinutes([int]$decision.PostponeMinutes)
+            $item.PostponeUntilUtc = $runAtLocal.ToUniversalTime().ToString("o")
             $item.PostponeChoice = "$($decision.PostponeMinutes) minutes"
-            Write-LogEntry "$browser postponed until $($item.PostponeUntilUtc) ($($item.PostponeChoice))"
+
+            $taskName = Register-PostponeScheduledTask -BrowserName $browser -RunAtLocal $runAtLocal -ScriptPath $RemediationScriptPath
+
+            if ($taskName) {
+                $item.ScheduledTaskName = $taskName
+                Write-LogEntry "$browser postponed until $($item.PostponeUntilUtc) ($($item.PostponeChoice)); scheduled task '$taskName' created"
+            }
+            else {
+                Write-LogEntry "Scheduled task creation failed for $browser; leaving item queued for retry" "Warning"
+            }
+
             $remainingQueue += $item
             continue
         }
