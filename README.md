@@ -4,74 +4,38 @@ This repository contains PowerShell scripts for Windows endpoint management, opt
 
 ## Scripts
 
-### Browser Update Management
+### Browser-Scripts
 
-#### Check-BrowserUpdates.ps1
-Checks for available browser updates for Google Chrome, Mozilla Firefox, and Microsoft Edge. Provides detailed reporting without forcing updates.
+- `Browser-Update-Detection.ps1` - Detects Chrome, Firefox, and Edge sessions that have been running long enough to warrant a restart and tracks usage state.
+- `Browser-Force-Restart.ps1` - Forces a browser restart workflow for pending updates, including queue handling, logging, and scheduled task cleanup.
 
-**See**: [Check Browser Updates Documentation](./README.md#check-browser-updates)
+### Java
 
-#### Force-BrowserUpdates.ps1
-Forces immediate browser updates with user notification and deferral options. Closes and restarts browsers to apply pending updates.
+- `Java-JRE-Update.ps1` - Detects, reports, installs, or upgrades the target Java JRE family using winget, with optional cleanup and old-version removal.
+- `Java-SDK-Update.ps1` - Detects, reports, installs, or upgrades the target Java JDK family using winget, with optional cleanup and old-version removal.
 
-**See**: [Force Updates Deployment Guide](./FORCE_RESTART_DEPLOYMENT.md) | [Datto Deployment Guide](./DATTO_DEPLOYMENT.md)
+## Usage
 
-**Features**:
-- Immediate update application
-- User deferral option
-- Pre/post-update notifications
-- Comprehensive logging
-
-#### Force-BrowserReload-PendingUpdates.ps1
-Monitors browser usage and automatically reloads browsers that haven't been opened in 72 hours and have pending updates. Provides a 5-minute countdown warning.
-
-**See**: [Browser Reload Deployment Guide](./BROWSER_RELOAD_DEPLOYMENT.md)
-
-**Features**:
-- 72-hour inactivity threshold
-- Pending update detection
-- 5-minute countdown warning
-- User cancellation option
-- Usage tracking via JSON
-
-## Quick Start
-
-### Using with Datto RMM
-
-1. Create a new PowerShell component
-2. Copy script contents
-3. Set execution policy: `Set-ExecutionPolicy Bypass -Scope Process -Force`
-4. Configure schedule (see deployment guides)
-5. Deploy to target sites/devices
-
-### Manual Execution
+Run scripts in an elevated PowerShell session on the target Windows device.
 
 ```powershell
-# Run with administrative privileges
 Set-ExecutionPolicy Bypass -Scope Process -Force
-.\scriptname.ps1
+
+.\Browser-Scripts\Browser-Update-Detection.ps1
+.\Browser-Scripts\Browser-Force-Restart.ps1
+
+.\Java\Java-JRE-Update.ps1 -TargetFamily 17
+.\Java\Java-SDK-Update.ps1 -TargetFamily 21
 ```
 
-## Deployment Guides
+Useful Java script options:
 
-- **[BROWSER_RELOAD_DEPLOYMENT.md](./BROWSER_RELOAD_DEPLOYMENT.md)** - Browser reload for pending updates
-- **[DATTO_DEPLOYMENT.md](./DATTO_DEPLOYMENT.md)** - General Datto RMM deployment instructions
-- **[FORCE_RESTART_DEPLOYMENT.md](./FORCE_RESTART_DEPLOYMENT.md)** - Force browser updates deployment
+- `-ReportOnly` checks whether an update is needed without making changes.
+- `-RemoveOlder` removes older installs in the same major family.
+- `-Cleanup` removes stale Java environment variables and PATH entries.
 
 ## Requirements
 
-- Windows 10/11 or Windows Server 2016+
-- PowerShell 5.1 or higher
+- Windows device with PowerShell 5.1+
 - Administrative privileges
-- Supported browsers: Chrome, Firefox, Edge
-
-## Logging
-
-All scripts maintain comprehensive logging:
-- **Location**: `C:\ProgramData\Datto\BrowserUpdateCheck\`
-- **Windows Event Log**: Custom source in "Datto RMM" log
-- **Console Output**: For RMM monitoring
-
-## Support
-
-For issues or questions, please review the relevant deployment guide or check the script logs at `C:\ProgramData\Datto\BrowserUpdateCheck\`.
+- `winget` for Java update/install workflows
