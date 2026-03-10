@@ -24,10 +24,10 @@
   If set, proceeds even if java/javaw processes are running (not recommended).
 
 .EXAMPLE
-  .\Update-JavaJDK.ps1 -TargetFamily 21 -ReportOnly
+  .\Java-SDK-Update.ps1 -TargetFamily 21 -ReportOnly
 
 .EXAMPLE
-  .\Update-JavaJDK.ps1 -TargetFamily 17 -RemoveOlder -Cleanup
+  .\Java-SDK-Update.ps1 -TargetFamily 17 -RemoveOlder -Cleanup
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
@@ -382,7 +382,8 @@ try {
 
   $installed = $scan.Best
   if ($installed) {
-    Write-Host "`nBest matching installed JDK $TargetFamily: $($installed.Version) @ $($installed.JavaHome)"
+    # FIX: ${TargetFamily} to avoid parsing $TargetFamily:
+    Write-Host "`nBest matching installed JDK ${TargetFamily}: $($installed.Version) @ $($installed.JavaHome)"
   } else {
     Write-Host "`nNo matching JDK $TargetFamily found."
   }
@@ -395,8 +396,12 @@ try {
   if ($installed -and $availableVer) {
     $i = $installed.Norm
     $a = Try-Normalize -VersionString $availableVer
-    if (-not $a) { Write-Warning "Could not normalize available version '$availableVer' — will attempt upgrade."; $needsUpdate = $true }
-    else { $needsUpdate = ($i.Key -lt $a.Key) }
+    if (-not $a) {
+      Write-Warning "Could not normalize available version '$availableVer' — will attempt upgrade."
+      $needsUpdate = $true
+    } else {
+      $needsUpdate = ($i.Key -lt $a.Key)
+    }
   } elseif ($installed -and -not $availableVer) {
     Write-Warning "Cannot determine available version. Will not auto-update without winget metadata."
     $needsUpdate = $false
@@ -427,7 +432,8 @@ try {
   $keepNorm = if ($keep) { $keep.Norm } else { $null }
 
   if ($keep) {
-    Write-Host "Post-action best JDK $TargetFamily: $($keep.Version) @ $($keep.JavaHome)"
+    # FIX: ${TargetFamily} to avoid parsing $TargetFamily:
+    Write-Host "Post-action best JDK ${TargetFamily}: $($keep.Version) @ $($keep.JavaHome)"
   } else {
     Write-Warning "After update, still no matching JDK $TargetFamily detected."
   }
