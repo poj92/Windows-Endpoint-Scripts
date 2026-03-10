@@ -1,33 +1,19 @@
 #Requires -Version 5.1
-<#
-.Java-SDK-Update.ps1
-
-Manages Java JDK (Temurin or Oracle) for a given major family (8/11/17/21):
-- Detect installed JDK(s) and pick the best (highest) for that family
-- Compare against winget "latest available" version
-- Install/upgrade if needed (unless -ReportOnly)
-- Optional: remove older JDKs of same family (-RemoveOlder)
-- Optional: cleanup stale JAVA_HOME and stale Java PATH entries (-Cleanup)
-
-Exit codes (useful for RMM):
-  0 = up-to-date or no action required
-  1 = performed an update/install
-  2 = ReportOnly and update would be required
-  3 = update required but cannot proceed (e.g., winget missing)
-#>
-
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
   [ValidateSet('Temurin','Oracle')]
   [string]$Vendor = 'Temurin',
 
   [ValidateSet(8,11,17,21)]
-  [int]$TargetFamily = 17,
+  [int]$TargetFamily = 21,
 
   [switch]$ReportOnly,
   [switch]$RemoveOlder,
   [switch]$Cleanup,
   [switch]$Force,
+
+  # If winget is missing, download and install Temurin MSI (Vendor must be Temurin)
+  [switch]$UseMsiFallback = $true,
 
   [string]$LogPath = "$env:ProgramData\JavaUpdate\JavaJDK-Update.log"
 )
@@ -38,53 +24,43 @@ $ErrorActionPreference = 'Stop'
 function Test-IsAdmin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   $p  = New-Object Security.Principal.WindowsPrincipal($id)
-  return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Ensure-Tls12ForPs5 {
+  if ($PSVersionTable.PSVersion.Major -lt 6) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  }
 }
 
 function Ensure-LogFolder {
   $dir = Split-Path -Parent $LogPath
-  if ($dir -and -not (Test-Path $dir)) {
-    New-Item -ItemType Directory -Path $dir -Force | Out-Null
-  }
+  if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
 function Normalize-JavaVersion {
   param([Parameter(Mandatory)][string]$VersionString)
-
   $v = $VersionString.Trim()
 
-  # Java 8 runtime style: 1.8.0_381-b09
   if ($v -match '^1\.8\.0_(\d+)(?:-b(\d+))?$') {
     $upd = [int]$Matches[1]
     $bld = if ($Matches[2]) { [int]$Matches[2] } else { 0 }
-    return [pscustomobject]@{
-      Raw=$v; Major=8; Minor=0; SecOrUpd=$upd; Build=$bld
-      Key = '{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f 8,0,$upd,$bld
-    }
+    return [pscustomobject]@{ Raw=$v; Major=8; Minor=0; SecOrUpd=$upd; Build=$bld; Key=('{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f 8,0,$upd,$bld) }
   }
 
-  # Common modern style: 17.0.10+7
   if ($v -match '^(\d+)\.(\d+)\.(\d+)\+(\d+)$') {
-    return [pscustomobject]@{
-      Raw=$v; Major=[int]$Matches[1]; Minor=[int]$Matches[2]; SecOrUpd=[int]$Matches[3]; Build=[int]$Matches[4]
-      Key = '{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3],[int]$Matches[4]
-    }
+    return [pscustomobject]@{ Raw=$v; Major=[int]$Matches[1]; Minor=[int]$Matches[2]; SecOrUpd=[int]$Matches[3]; Build=[int]$Matches[4];
+      Key=('{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3],[int]$Matches[4]) }
   }
 
-  # winget/registry often: 17.0.10.7 or 8.0.382.5
   if ($v -match '^(\d+)\.(\d+)\.(\d+)\.(\d+)$') {
-    return [pscustomobject]@{
-      Raw=$v; Major=[int]$Matches[1]; Minor=[int]$Matches[2]; SecOrUpd=[int]$Matches[3]; Build=[int]$Matches[4]
-      Key = '{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3],[int]$Matches[4]
-    }
+    return [pscustomobject]@{ Raw=$v; Major=[int]$Matches[1]; Minor=[int]$Matches[2]; SecOrUpd=[int]$Matches[3]; Build=[int]$Matches[4];
+      Key=('{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3],[int]$Matches[4]) }
   }
 
-  # sometimes: 17.0.10 (no build)
   if ($v -match '^(\d+)\.(\d+)\.(\d+)$') {
-    return [pscustomobject]@{
-      Raw=$v; Major=[int]$Matches[1]; Minor=[int]$Matches[2]; SecOrUpd=[int]$Matches[3]; Build=0
-      Key = '{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3],0
-    }
+    return [pscustomobject]@{ Raw=$v; Major=[int]$Matches[1]; Minor=[int]$Matches[2]; SecOrUpd=[int]$Matches[3]; Build=0;
+      Key=('{0:D3}.{1:D3}.{2:D5}.{3:D5}' -f [int]$Matches[1],[int]$Matches[2],[int]$Matches[3],0) }
   }
 
   throw "Cannot normalize Java version string: '$VersionString'"
@@ -93,38 +69,29 @@ function Normalize-JavaVersion {
 function Try-Normalize {
   param([string]$VersionString)
   if (-not $VersionString) { return $null }
-  try { return Normalize-JavaVersion -VersionString $VersionString } catch { return $null }
+  try { Normalize-JavaVersion -VersionString $VersionString } catch { $null }
 }
 
 function Get-JavaSettings {
   param([Parameter(Mandatory)][string]$JavaExePath)
-
   $out = & $JavaExePath -XshowSettings:properties -version 2>&1
-
   $runtimeLine = $out | Where-Object { $_ -match '^\s*java\.runtime\.version\s*=' } | Select-Object -First 1
   $homeLine    = $out | Where-Object { $_ -match '^\s*java\.home\s*=' } | Select-Object -First 1
-
   $runtimeVer = if ($runtimeLine) { (($runtimeLine -split '=',2)[1]).Trim() } else { $null }
   $javaHome   = if ($homeLine)    { (($homeLine    -split '=',2)[1]).Trim() } else { $null }
-
-  [pscustomobject]@{ RuntimeVersion = $runtimeVer; JavaHome = $javaHome }
+  [pscustomobject]@{ RuntimeVersion=$runtimeVer; JavaHome=$javaHome }
 }
 
 function Resolve-JdkHome {
   param([Parameter(Mandatory)][string]$JavaHome)
-
-  # JDK9+ typically: java.home == JDK root
   $javacHere = Join-Path $JavaHome 'bin\javac.exe'
   if (Test-Path $javacHere) { return $JavaHome }
-
-  # JDK8: java.home often ends with \jre, javac is in parent\bin
   $parent = Split-Path -Parent $JavaHome
   if ($parent) {
     $javacParent = Join-Path $parent 'bin\javac.exe'
     if (Test-Path $javacParent) { return $parent }
   }
-
-  return $null
+  $null
 }
 
 function Find-JavaCandidates {
@@ -153,12 +120,11 @@ function Find-JavaCandidates {
     }
   }
 
-  return @($candidates | Sort-Object -Unique)
+  @($candidates | Sort-Object -Unique)
 }
 
 function Get-InstalledJdkForFamily {
   param([Parameter(Mandatory)][int]$Family)
-
   $best = $null
   $all  = @()
 
@@ -171,15 +137,11 @@ function Get-InstalledJdkForFamily {
     if (-not $norm) { continue }
 
     $jdkHome = Resolve-JdkHome -JavaHome $settings.JavaHome
-    $isJdk   = [bool]$jdkHome
+    $isJdk = [bool]$jdkHome
 
     $entry = [pscustomobject]@{
-      JavaExe  = $javaExe
-      JavaHome = $settings.JavaHome
-      JdkHome  = $jdkHome
-      IsJdk    = $isJdk
-      Version  = $settings.RuntimeVersion
-      Norm     = $norm
+      JavaExe=$javaExe; JavaHome=$settings.JavaHome; JdkHome=$jdkHome; IsJdk=$isJdk;
+      Version=$settings.RuntimeVersion; Norm=$norm
     }
     $all += $entry
 
@@ -188,12 +150,11 @@ function Get-InstalledJdkForFamily {
     }
   }
 
-  [pscustomobject]@{ Best = $best; All = $all }
+  [pscustomobject]@{ Best=$best; All=$all }
 }
 
 function Get-WingetId {
   param([Parameter(Mandatory)][string]$Vendor, [Parameter(Mandatory)][int]$Family)
-
   if ($Vendor -eq 'Temurin') { return "EclipseAdoptium.Temurin.$Family.JDK" }
   if ($Vendor -eq 'Oracle')  { return "Oracle.JDK.$Family" }
   throw "Unknown vendor: $Vendor"
@@ -201,11 +162,9 @@ function Get-WingetId {
 
 function Get-WingetAvailableVersion {
   param([Parameter(Mandatory)][string]$WingetId)
-
   $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
   if (-not $winget) { throw "winget.exe not found." }
 
-  # Try JSON output first
   try {
     $json = & $winget.Source show --exact --id $WingetId --output json 2>$null
     if ($LASTEXITCODE -eq 0 -and $json) {
@@ -215,7 +174,6 @@ function Get-WingetAvailableVersion {
     }
   } catch { }
 
-  # Fallback: parse text
   $txt = & $winget.Source show --exact --id $WingetId 2>&1
   $line = $txt | Where-Object { $_ -match '^\s*Version:\s*' } | Select-Object -First 1
   if ($line) { return ($line -replace '^\s*Version:\s*','').Trim() }
@@ -225,7 +183,6 @@ function Get-WingetAvailableVersion {
 
 function InstallOrUpgrade-WithWinget {
   param([Parameter(Mandatory)][string]$WingetId)
-
   $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
   if (-not $winget) { throw "winget.exe not found." }
 
@@ -254,6 +211,29 @@ function InstallOrUpgrade-WithWinget {
   }
 }
 
+function Install-TemurinJdkViaMsi {
+  param([Parameter(Mandatory)][int]$Family)
+
+  Ensure-Tls12ForPs5
+
+  # Adoptium "latest installer" endpoint (MSI)
+  $url = "https://api.adoptium.net/v3/installer/latest/$Family/ga/windows/x64/jdk/hotspot/normal/eclipse?project=jdk"
+
+  $dir = Join-Path $env:TEMP "JavaUpdate"
+  New-Item -ItemType Directory -Path $dir -Force | Out-Null
+  $msi = Join-Path $dir ("temurin-jdk-{0}-latest.msi" -f $Family)
+
+  if ($PSCmdlet.ShouldProcess($url, "Download MSI to $msi")) {
+    Invoke-WebRequest -Uri $url -OutFile $msi -UseBasicParsing
+  }
+
+  $args = "/i `"$msi`" /qn /norestart"
+  if ($PSCmdlet.ShouldProcess("msiexec.exe $args", "Install Temurin JDK MSI")) {
+    $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -NoNewWindow
+    if ($p.ExitCode -ne 0) { throw "msiexec failed (exit $($p.ExitCode)) installing $msi" }
+  }
+}
+
 function Get-UninstallEntries {
   $paths = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -265,11 +245,10 @@ function Get-UninstallEntries {
       Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
       ForEach-Object {
         [pscustomobject]@{
-          DisplayName          = $_.DisplayName
-          DisplayVersion       = $_.DisplayVersion
-          Publisher            = $_.Publisher
-          UninstallString      = $_.UninstallString
-          QuietUninstallString = $_.QuietUninstallString
+          DisplayName=$_.DisplayName
+          DisplayVersion=$_.DisplayVersion
+          UninstallString=$_.UninstallString
+          QuietUninstallString=$_.QuietUninstallString
         }
       }
   }
@@ -279,25 +258,21 @@ function Get-MsiProductCodeFromUninstallString {
   param([string]$UninstallString)
   if (-not $UninstallString) { return $null }
   $m = [regex]::Match($UninstallString, '\{[0-9A-Fa-f\-]{36}\}')
-  if ($m.Success) { return $m.Value }
-  return $null
+  if ($m.Success) { $m.Value } else { $null }
 }
 
 function Try-ExtractVersionFromUninstallEntry {
   param([Parameter(Mandatory)]$Entry)
-
   if ($Entry.DisplayVersion) { return [string]$Entry.DisplayVersion }
 
-  # Try to pull from DisplayName if DisplayVersion is empty
   $name = [string]$Entry.DisplayName
-
   $m8  = [regex]::Match($name, '(1\.8\.0_\d+(?:-b\d+)?)')
   if ($m8.Success) { return $m8.Groups[1].Value }
 
   $mV  = [regex]::Match($name, '(\d+\.\d+\.\d+(?:\.\d+)?(?:\+\d+)?)')
   if ($mV.Success) { return $mV.Groups[1].Value }
 
-  return $null
+  $null
 }
 
 function Uninstall-EntrySilently {
@@ -350,12 +325,8 @@ function Cleanup-EnvVarsAndPath {
 
     foreach ($p in $parts) {
       $pp = $p.Trim()
-
-      # Only prune "Java-ish" entries if they are broken (do not exist)
       $looksJava = ($pp -match '\\java\\' -or $pp -match '\\javapath' -or $pp -match '\\eclipse adoptium\\' -or $pp -match '\\temurin\\' -or $pp -match '\\adoptium\\')
-      if ($looksJava -and -not (Test-Path $pp)) {
-        continue
-      }
+      if ($looksJava -and -not (Test-Path $pp)) { continue }
       $newParts += $pp
     }
 
@@ -368,7 +339,7 @@ function Cleanup-EnvVarsAndPath {
   }
 }
 
-# -------------------- main --------------------
+# -------- main --------
 if (-not (Test-IsAdmin)) { throw "Run this script as Administrator." }
 
 Ensure-LogFolder
@@ -382,35 +353,28 @@ try {
 
   $wingetId = Get-WingetId -Vendor $Vendor -Family $TargetFamily
   Write-Host ("Managing JDK: Vendor={0} Family={1} wingetId={2}" -f $Vendor, $TargetFamily, $wingetId)
+  Write-Host ""
 
   $scan = Get-InstalledJdkForFamily -Family $TargetFamily
-
-  if ($scan.All.Count -gt 0) {
-    Write-Host ""
-    Write-Host "Detected Java runtimes:"
-    $scan.All | Sort-Object { $_.Norm.Key } -Descending | ForEach-Object {
-      $jdkMark = if ($_.IsJdk) { "JDK" } else { "not-JDK" }
-      Write-Host ("- {0}  Home={1}  ({2})" -f $_.Version, $_.JavaHome, $jdkMark)
-    }
-  }
-
   $installed = $scan.Best
+
   if ($installed) {
-    Write-Host ""
     Write-Host ("Best matching installed JDK {0}: {1} @ {2}" -f $TargetFamily, $installed.Version, $installed.JdkHome)
   } else {
-    Write-Host ""
     Write-Host ("No matching JDK {0} found." -f $TargetFamily)
   }
 
+  $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
   $availableVer = $null
-  $wingetMissing = $false
-  try {
-    $availableVer = Get-WingetAvailableVersion -WingetId $wingetId
-    Write-Host ("Latest available via winget: {0}" -f $availableVer)
-  } catch {
-    Write-Warning $_.Exception.Message
-    if ($_.Exception.Message -match 'winget\.exe not found') { $wingetMissing = $true }
+  if ($winget) {
+    try {
+      $availableVer = Get-WingetAvailableVersion -WingetId $wingetId
+      Write-Host ("Latest available via winget: {0}" -f $availableVer)
+    } catch {
+      Write-Warning $_.Exception.Message
+    }
+  } else {
+    Write-Warning "winget.exe not found."
   }
 
   $needsUpdate = $false
@@ -419,40 +383,38 @@ try {
   } elseif ($availableVer) {
     $i = $installed.Norm
     $a = Try-Normalize -VersionString $availableVer
-    if (-not $a) {
-      Write-Warning ("Could not normalize available version '{0}' - will treat as update-needed." -f $availableVer)
-      $needsUpdate = $true
-    } else {
-      $needsUpdate = ($i.Key -lt $a.Key)
-    }
+    $needsUpdate = if ($a) { $i.Key -lt $a.Key } else { $true }
   } else {
-    Write-Warning "Available version unknown; cannot determine if update is required."
-    $needsUpdate = $false
+    # If winget missing, we still consider "missing install" as update-needed; otherwise we can't compare reliably.
+    $needsUpdate = (-not $installed)
   }
 
   if ($ReportOnly) {
     Write-Host ""
     Write-Host ("ReportOnly: Update required? {0}" -f $needsUpdate)
-    if ($RemoveOlder -or $Cleanup) {
-      Write-Host ("ReportOnly: Would run RemoveOlder={0} Cleanup={1}" -f $RemoveOlder, $Cleanup)
-    }
     exit ($(if ($needsUpdate) { 2 } else { 0 }))
   }
 
-  if ($needsUpdate) {
-    if ($wingetMissing) {
-      Write-Error "Update required, but winget is missing. Install App Installer / winget, or deploy Java via another method."
-      exit 3
-    }
+  $didUpdate = $false
 
-    Write-Host ""
-    Write-Host "Updating/Installing via winget..."
-    InstallOrUpgrade-WithWinget -WingetId $wingetId
-    $didUpdate = $true
+  if ($needsUpdate) {
+    if ($winget) {
+      Write-Host ""
+      Write-Host "Updating/Installing via winget..."
+      InstallOrUpgrade-WithWinget -WingetId $wingetId
+      $didUpdate = $true
+    } else {
+      if ($Vendor -ne 'Temurin') { throw "winget missing and MSI fallback only supports Vendor=Temurin." }
+      if (-not $UseMsiFallback) { throw "winget missing and -UseMsiFallback not set." }
+
+      Write-Host ""
+      Write-Host "winget missing - installing via Temurin MSI fallback..."
+      Install-TemurinJdkViaMsi -Family $TargetFamily
+      $didUpdate = $true
+    }
   } else {
     Write-Host ""
     Write-Host "No update required."
-    $didUpdate = $false
   }
 
   # Re-scan
@@ -471,11 +433,8 @@ try {
     Write-Host ("Removing older JDK installs for family {0} (best-effort)..." -f $TargetFamily)
 
     $entries = Get-UninstallEntries
-
     $candidates = $entries | Where-Object {
-      # JDK-ish names
       ($_.DisplayName -match 'JDK|Development Kit|Temurin.*JDK|Adoptium.*JDK|Java.*Development') -and
-      # vendor-ish names
       ( ($Vendor -eq 'Temurin' -and $_.DisplayName -match 'Temurin|Eclipse Adoptium|Adoptium') -or
         ($Vendor -eq 'Oracle'  -and $_.DisplayName -match 'Oracle|Java') )
     }
