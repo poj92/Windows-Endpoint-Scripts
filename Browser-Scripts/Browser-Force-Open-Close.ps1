@@ -1,23 +1,23 @@
 #Requires -Version 5.1
 <#
-Browser-Force-Open-Close.ps1
+Browser-PerBrowser-Nudge.ps1
 
-Checks whether ANY installed browser has been opened within the last N hours.
-If not, launches one installed browser and closes only newly started processes after a delay.
+Per-browser logic:
+- For EACH installed browser, determine whether it was opened within the last N hours.
+- If a specific browser was not opened within the window, launch it and close it after a delay.
+- Does NOT rely solely on Prefetch (which can be bumped by background activity).
 
-Installed browser detection (SYSTEM-friendly):
-- Known machine paths (Program Files / Program Files (x86))
-- App Paths registry (HKLM + HKLM\WOW6432Node + HKCU)
-
-Last-open detection:
-- Prefetch last write time for the browser EXE name (best signal)
-- Fallback: currently running browser processes with StartTime within lookback
+Signals used (in this order):
+1) If browser is currently running (StartTime within lookback) -> counts
+2) User profile activity files (best proxy for real user usage)
+3) Process creation event logs (Sysmon ID 1, else Security 4688 if enabled)
+4) Prefetch last write time (least reliable; can be background)
 
 Exit codes:
-  0 = at least one installed browser opened within lookback (no action)
-  1 = none opened; script launched and then closed a browser
-  2 = ReportOnly and launch would have occurred
-  3 = no supported browser installed
+  0 = all installed browsers were opened within lookback (no action)
+  1 = at least one browser was nudged (opened then closed)
+  2 = ReportOnly and at least one browser would be nudged
+  3 = no supported browsers installed
   4 = error
 #>
 
@@ -27,16 +27,47 @@ param(
   [int]$OpenSeconds = 120,
   [string]$Url = 'about:blank',
   [switch]$ReportOnly,
+
+  # Preference order for processing (also affects "which gets nudged first")
+  [ValidateSet('Edge','Chrome','Firefox','Brave','Opera')]
   [string[]]$Preference = @('Edge','Chrome','Firefox','Brave','Opera')
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
+function Get-ConsoleUserName {
+  try {
+    $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+    if ($u) { return $u }
+  } catch { }
+  return $null
+}
+
+function Get-ProfilePathsForUser {
+  param([Parameter(Mandatory)][string]$UserName)
+
+  try {
+    $sid = (New-Object System.Security.Principal.NTAccount($UserName)).
+      Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $key = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid"
+    $p = (Get-ItemProperty -Path $key -ErrorAction Stop).ProfileImagePath
+    if (-not $p -or -not (Test-Path $p)) { return $null }
+
+    return [pscustomobject]@{
+      UserName       = $UserName
+      ProfilePath    = $p
+      LocalAppData   = Join-Path $p 'AppData\Local'
+      RoamingAppData = Join-Path $p 'AppData\Roaming'
+    }
+  } catch {
+    return $null
+  }
+}
+
 function Get-AppPathExe {
   param([Parameter(Mandatory)][string]$ExeName)
 
-  # Read default value from App Paths using .NET registry APIs (works across PS versions)
   $subKeys = @(
     "SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
     "SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\$ExeName"
@@ -54,7 +85,6 @@ function Get-AppPathExe {
       } catch { }
     }
   }
-
   return $null
 }
 
@@ -71,135 +101,254 @@ function Get-PrefetchLastRun {
   ($files | Sort-Object LastWriteTime -Descending | Select-Object -First 1).LastWriteTime
 }
 
-function Get-ProcessLastRunFallback {
+function Get-LatestWriteTime {
+  param([Parameter(Mandatory)][string[]]$PathsOrWildcards)
+
+  $latest = $null
+  foreach ($p in $PathsOrWildcards) {
+    try {
+      $items = Get-ChildItem -Path $p -ErrorAction SilentlyContinue
+      foreach ($i in $items) {
+        if (-not $latest -or $i.LastWriteTime -gt $latest) { $latest = $i.LastWriteTime }
+      }
+    } catch { }
+  }
+  return $latest
+}
+
+function Get-ProcessStartWithinLookback {
   param(
     [Parameter(Mandatory)][string[]]$ProcNames,
     [Parameter(Mandatory)][datetime]$Cutoff
   )
 
-  $times = @()
+  $latest = $null
   foreach ($pn in $ProcNames) {
     $procs = Get-Process -Name $pn -ErrorAction SilentlyContinue
     foreach ($p in $procs) {
       try {
-        if ($p.StartTime -ge $Cutoff) { $times += $p.StartTime }
+        if ($p.StartTime -ge $Cutoff) {
+          if (-not $latest -or $p.StartTime -gt $latest) { $latest = $p.StartTime }
+        }
       } catch { }
     }
   }
+  return $latest
+}
 
-  if (-not $times -or $times.Count -eq 0) { return $null }
-  ($times | Sort-Object -Descending | Select-Object -First 1)
+function Get-ProcessCreateTimesFromEventLogs {
+  param(
+    [Parameter(Mandatory)][string[]]$ExeLeafNames,
+    [Parameter(Mandatory)][datetime]$Cutoff
+  )
+
+  $result = @{}  # leaf -> datetime
+
+  # Sysmon (best, if present)
+  try {
+    $sysmonLog = Get-WinEvent -ListLog 'Microsoft-Windows-Sysmon/Operational' -ErrorAction SilentlyContinue
+    if ($sysmonLog) {
+      $events = Get-WinEvent -FilterHashtable @{ LogName='Microsoft-Windows-Sysmon/Operational'; Id=1; StartTime=$Cutoff } -ErrorAction SilentlyContinue
+      foreach ($e in $events) {
+        try {
+          $xml = [xml]$e.ToXml()
+          $img = ($xml.Event.EventData.Data | Where-Object { $_.Name -eq 'Image' } | Select-Object -First 1).'#text'
+          if (-not $img) { continue }
+          $leaf = [System.IO.Path]::GetFileName($img).ToLowerInvariant()
+          if ($ExeLeafNames -notcontains $leaf) { continue }
+          if (-not $result.ContainsKey($leaf) -or $e.TimeCreated -gt $result[$leaf]) {
+            $result[$leaf] = $e.TimeCreated
+          }
+        } catch { }
+      }
+      return $result
+    }
+  } catch { }
+
+  # Security 4688 (if enabled)
+  try {
+    $events = Get-WinEvent -FilterHashtable @{ LogName='Security'; Id=4688; StartTime=$Cutoff } -ErrorAction SilentlyContinue
+    foreach ($e in $events) {
+      $msg = $e.Message
+      if (-not $msg) { continue }
+      foreach ($leaf in $ExeLeafNames) {
+        if ($msg -match [regex]::Escape($leaf)) {
+          if (-not $result.ContainsKey($leaf) -or $e.TimeCreated -gt $result[$leaf]) {
+            $result[$leaf] = $e.TimeCreated
+          }
+        }
+      }
+    }
+  } catch { }
+
+  return $result
 }
 
 function Find-InstalledBrowsers {
-  # Define supported browsers (machine-wide paths + app paths)
+  param([string[]]$Names)
+
   $defs = @(
     @{
-      Name='Edge';    ProcNames=@('msedge');  AppExe='msedge.exe';  PrefetchBases=@('msedge');
+      Name='Edge'; ProcNames=@('msedge'); ExeLeaf='msedge.exe'; PrefetchBases=@('msedge');
       Candidates=@("$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-                   "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe")
+                   "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe");
+      ProfileKind='Chromium'; ProfileRootRel=@('Microsoft\Edge\User Data')
     },
     @{
-      Name='Chrome';  ProcNames=@('chrome');  AppExe='chrome.exe';  PrefetchBases=@('chrome');
+      Name='Chrome'; ProcNames=@('chrome'); ExeLeaf='chrome.exe'; PrefetchBases=@('chrome');
       Candidates=@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-                   "$env:ProgramFiles (x86)\Google\Chrome\Application\chrome.exe")
+                   "$env:ProgramFiles (x86)\Google\Chrome\Application\chrome.exe");
+      ProfileKind='Chromium'; ProfileRootRel=@('Google\Chrome\User Data')
     },
     @{
-      Name='Firefox'; ProcNames=@('firefox'); AppExe='firefox.exe'; PrefetchBases=@('firefox');
-      Candidates=@("$env:ProgramFiles\Mozilla Firefox\firefox.exe",
-                   "$env:ProgramFiles (x86)\Mozilla Firefox\firefox.exe")
-    },
-    @{
-      Name='Brave';   ProcNames=@('brave');   AppExe='brave.exe';   PrefetchBases=@('brave');
+      Name='Brave'; ProcNames=@('brave'); ExeLeaf='brave.exe'; PrefetchBases=@('brave');
       Candidates=@("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
-                   "$env:ProgramFiles (x86)\BraveSoftware\Brave-Browser\Application\brave.exe")
+                   "$env:ProgramFiles (x86)\BraveSoftware\Brave-Browser\Application\brave.exe");
+      ProfileKind='Chromium'; ProfileRootRel=@('BraveSoftware\Brave-Browser\User Data')
     },
     @{
-      # Opera typically launches via launcher.exe but spawns opera.exe
-      Name='Opera';   ProcNames=@('opera','launcher'); AppExe='launcher.exe'; PrefetchBases=@('opera','launcher');
+      Name='Firefox'; ProcNames=@('firefox'); ExeLeaf='firefox.exe'; PrefetchBases=@('firefox');
+      Candidates=@("$env:ProgramFiles\Mozilla Firefox\firefox.exe",
+                   "$env:ProgramFiles (x86)\Mozilla Firefox\firefox.exe");
+      ProfileKind='Firefox'; ProfileRootRel=@('Mozilla\Firefox')
+    },
+    @{
+      Name='Opera'; ProcNames=@('opera','launcher'); ExeLeaf='launcher.exe'; PrefetchBases=@('opera','launcher');
       Candidates=@("$env:ProgramFiles\Opera\launcher.exe",
-                   "$env:ProgramFiles (x86)\Opera\launcher.exe")
+                   "$env:ProgramFiles (x86)\Opera\launcher.exe");
+      ProfileKind='Opera'; ProfileRootRel=@('Opera Software\Opera Stable')
     }
   )
 
   $installed = @()
 
-  foreach ($b in $defs) {
+  foreach ($name in $Names) {
+    $b = $defs | Where-Object { $_.Name -eq $name } | Select-Object -First 1
+    if (-not $b) { continue }
+
     $exePath = $null
-
-    foreach ($c in $b.Candidates) {
-      if ($c -and (Test-Path $c)) { $exePath = $c; break }
-    }
-
-    if (-not $exePath) {
-      $exePath = Get-AppPathExe -ExeName $b.AppExe
-    }
+    foreach ($c in $b.Candidates) { if ($c -and (Test-Path $c)) { $exePath = $c; break } }
+    if (-not $exePath) { $exePath = Get-AppPathExe -ExeName $b.ExeLeaf }
 
     if ($exePath) {
       $installed += [pscustomobject]@{
-        Name = $b.Name
-        ExePath = $exePath
-        ProcNames = $b.ProcNames
-        PrefetchBases = $b.PrefetchBases
+        Name=$b.Name; ExePath=$exePath; ExeLeaf=$b.ExeLeaf; ProcNames=$b.ProcNames; PrefetchBases=$b.PrefetchBases;
+        ProfileKind=$b.ProfileKind; ProfileRootRel=$b.ProfileRootRel
       }
     }
   }
 
-  # Order by preference
+  # keep preference order
   $ordered = @()
-  foreach ($p in $Preference) {
+  foreach ($p in $Names) {
     $hit = $installed | Where-Object { $_.Name -eq $p } | Select-Object -First 1
     if ($hit) { $ordered += $hit }
   }
-  foreach ($x in $installed) {
-    if (-not ($ordered | Where-Object { $_.Name -eq $x.Name })) { $ordered += $x }
-  }
-
-  return $ordered
+  $ordered
 }
 
-function Get-LastOpenStatus {
+function Get-ProfileActivityTime {
   param(
-    [Parameter(Mandatory)]$InstalledBrowsers,
-    [Parameter(Mandatory)][datetime]$Cutoff
+    [Parameter(Mandatory)]$Browser,
+    [Parameter(Mandatory)]$UserPaths
   )
 
-  $status = @()
+  if (-not $UserPaths) { return $null }
 
-  foreach ($b in $InstalledBrowsers) {
-    $prefetchTimes = @()
-    foreach ($base in $b.PrefetchBases) {
-      $t = $null
-      try { $t = Get-PrefetchLastRun -ExeBaseName $base } catch { $t = $null }
-      if ($t) { $prefetchTimes += $t }
-    }
+  if ($Browser.ProfileKind -eq 'Chromium') {
+    $root = Join-Path $UserPaths.LocalAppData ($Browser.ProfileRootRel[0])
+    if (-not (Test-Path $root)) { return $null }
 
-    $prefetchTime = $null
-    if ($prefetchTimes.Count -gt 0) {
-      $prefetchTime = ($prefetchTimes | Sort-Object -Descending | Select-Object -First 1)
-    }
-
-    $fallbackTime = $null
-    if (-not $prefetchTime) {
-      $fallbackTime = Get-ProcessLastRunFallback -ProcNames $b.ProcNames -Cutoff $Cutoff
-    }
-
-    $last = $prefetchTime
-    $source = 'Prefetch'
-    if (-not $last) { $last = $fallbackTime; $source = 'ProcessStartTime' }
-    if (-not $last) { $source = 'None' }
-
-    $status += [pscustomobject]@{
-      Browser = $b.Name
-      ExePath = $b.ExePath
-      ProcNames = $b.ProcNames
-      LastOpened = $last
-      Source = $source
-      OpenedWithinLookback = [bool]($last -and $last -ge $Cutoff)
-    }
+    # Look across Default + Profile* for files that change with real usage.
+    $paths = @(
+      (Join-Path $root 'Default\History'),
+      (Join-Path $root 'Default\Current Session'),
+      (Join-Path $root 'Default\Current Tabs'),
+      (Join-Path $root 'Default\Last Session'),
+      (Join-Path $root 'Default\Last Tabs'),
+      (Join-Path $root 'Default\Preferences'),
+      (Join-Path $root 'Profile *\History'),
+      (Join-Path $root 'Profile *\Current Session'),
+      (Join-Path $root 'Profile *\Current Tabs'),
+      (Join-Path $root 'Profile *\Last Session'),
+      (Join-Path $root 'Profile *\Last Tabs'),
+      (Join-Path $root 'Profile *\Preferences')
+    )
+    return Get-LatestWriteTime -PathsOrWildcards $paths
   }
 
-  return $status
+  if ($Browser.ProfileKind -eq 'Firefox') {
+    $base = Join-Path $UserPaths.RoamingAppData ($Browser.ProfileRootRel[0])
+    if (-not (Test-Path $base)) { return $null }
+
+    # Try profiles.ini to find profile dirs; else wildcard
+    $paths = @(
+      (Join-Path $base 'profiles.ini'),
+      (Join-Path $base 'Profiles\*\places.sqlite'),
+      (Join-Path $base 'Profiles\*\sessionstore.jsonlz4'),
+      (Join-Path $base 'Profiles\*\prefs.js')
+    )
+    return Get-LatestWriteTime -PathsOrWildcards $paths
+  }
+
+  if ($Browser.ProfileKind -eq 'Opera') {
+    # Opera Stable profile is usually under Roaming
+    $base = Join-Path $UserPaths.RoamingAppData ($Browser.ProfileRootRel[0])
+    if (-not (Test-Path $base)) { return $null }
+
+    $paths = @(
+      (Join-Path $base 'History'),
+      (Join-Path $base 'Current Session'),
+      (Join-Path $base 'Current Tabs'),
+      (Join-Path $base 'Last Session'),
+      (Join-Path $base 'Last Tabs'),
+      (Join-Path $base 'Preferences')
+    )
+    return Get-LatestWriteTime -PathsOrWildcards $paths
+  }
+
+  return $null
+}
+
+function Get-BrowserLastOpened {
+  param(
+    [Parameter(Mandatory)]$Browser,
+    [Parameter(Mandatory)][datetime]$Cutoff,
+    [Parameter(Mandatory)]$EventTimesByLeaf,
+    $UserPaths
+  )
+
+  # 1) If currently running within window
+  $running = Get-ProcessStartWithinLookback -ProcNames $Browser.ProcNames -Cutoff $Cutoff
+  if ($running) {
+    return [pscustomobject]@{ Time=$running; Source='RunningProcess' }
+  }
+
+  # 2) Profile activity (best user signal)
+  $profileTime = Get-ProfileActivityTime -Browser $Browser -UserPaths $UserPaths
+  if ($profileTime) {
+    return [pscustomobject]@{ Time=$profileTime; Source='ProfileActivity' }
+  }
+
+  # 3) Event logs
+  $leaf = $Browser.ExeLeaf.ToLowerInvariant()
+  if ($EventTimesByLeaf.ContainsKey($leaf)) {
+    return [pscustomobject]@{ Time=$EventTimesByLeaf[$leaf]; Source='EventLog' }
+  }
+
+  # 4) Prefetch (least reliable)
+  $prefTimes = @()
+  foreach ($base in $Browser.PrefetchBases) {
+    $t = $null
+    try { $t = Get-PrefetchLastRun -ExeBaseName $base } catch { $t = $null }
+    if ($t) { $prefTimes += $t }
+  }
+  if ($prefTimes.Count -gt 0) {
+    $pt = ($prefTimes | Sort-Object -Descending | Select-Object -First 1)
+    return [pscustomobject]@{ Time=$pt; Source='Prefetch' }
+  }
+
+  return [pscustomobject]@{ Time=$null; Source='None' }
 }
 
 function Close-NewProcesses {
@@ -222,10 +371,7 @@ function Close-NewProcesses {
       $ok = $true
       try {
         if ($p.StartTime -lt $LaunchTime.AddSeconds(-5)) { $ok = $false }
-      } catch {
-        # If StartTime not accessible, still treat as potentially new (best-effort)
-        $ok = $true
-      }
+      } catch { $ok = $true }
 
       if ($ok) { $newProcs += $p }
     }
@@ -233,85 +379,129 @@ function Close-NewProcesses {
 
   if (-not $newProcs -or $newProcs.Count -eq 0) { return }
 
-  # Graceful close first
   foreach ($p in $newProcs) {
-    try {
-      if ($p.MainWindowHandle -ne 0) { [void]$p.CloseMainWindow() }
-    } catch { }
+    try { if ($p.MainWindowHandle -ne 0) { [void]$p.CloseMainWindow() } } catch { }
   }
 
   Start-Sleep -Seconds 10
 
-  # Force close leftovers
   foreach ($p in $newProcs) {
     try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { }
   }
+}
+
+function Get-LaunchArgs {
+  param([Parameter(Mandatory)][string]$BrowserName, [Parameter(Mandatory)][string]$Url)
+
+  # Use flags that force a visible window where possible
+  if ($BrowserName -in @('Edge','Chrome','Brave')) { return "--new-window $Url" }
+  if ($BrowserName -eq 'Firefox') { return "-new-window $Url" }
+  if ($BrowserName -eq 'Opera') { return $Url }
+  return $Url
 }
 
 # ---------------- main ----------------
 try {
   $cutoff = (Get-Date).AddHours(-[double]$LookbackHours)
 
-  $installed = Find-InstalledBrowsers
+  $installed = Find-InstalledBrowsers -Names $Preference
   if (-not $installed -or $installed.Count -eq 0) {
     Write-Host "No supported browsers found installed on this machine."
     exit 3
   }
 
+  $consoleUser = Get-ConsoleUserName
+  $userPaths = $null
+  if ($consoleUser) { $userPaths = Get-ProfilePathsForUser -UserName $consoleUser }
+
+  Write-Host "Browser-PerBrowser-Nudge"
   Write-Host ("Lookback window: last {0} hours (since {1})" -f $LookbackHours, $cutoff)
+  if ($userPaths) {
+    Write-Host ("Console user: {0}  Profile: {1}" -f $userPaths.UserName, $userPaths.ProfilePath)
+  } else {
+    Write-Host "Console user profile: not available (SYSTEM/no interactive user)."
+  }
+
+  Write-Host ""
   Write-Host "Installed browsers detected:"
   foreach ($b in $installed) {
     Write-Host ("- {0} => {1}" -f $b.Name, $b.ExePath)
   }
 
-  $status = Get-LastOpenStatus -InstalledBrowsers $installed -Cutoff $cutoff
+  # Build event time map once (per run)
+  $exeLeafs = @($installed | ForEach-Object { $_.ExeLeaf.ToLowerInvariant() }) | Sort-Object -Unique
+  $eventMap = Get-ProcessCreateTimesFromEventLogs -ExeLeafNames $exeLeafs -Cutoff $cutoff
+
+  # Evaluate each browser independently
+  $status = @()
+  foreach ($b in $installed) {
+    $info = Get-BrowserLastOpened -Browser $b -Cutoff $cutoff -EventTimesByLeaf $eventMap -UserPaths $userPaths
+    $within = [bool]($info.Time -and $info.Time -ge $cutoff)
+
+    $status += [pscustomobject]@{
+      Browser=$b.Name
+      ExePath=$b.ExePath
+      LastOpened=$info.Time
+      Source=$info.Source
+      OpenedWithinLookback=$within
+      NeedsAction = -not $within
+      ProcNames = $b.ProcNames
+    }
+  }
 
   Write-Host ""
-  Write-Host "Last-open status:"
+  Write-Host "Per-browser last-open status:"
   foreach ($s in $status) {
     $t = '<unknown>'
     if ($s.LastOpened) { $t = $s.LastOpened.ToString('yyyy-MM-dd HH:mm:ss') }
-    Write-Host ("{0}: LastOpened={1} Source={2} OpenedWithinLookback={3}" -f $s.Browser, $t, $s.Source, $s.OpenedWithinLookback)
+    Write-Host ("{0}: LastOpened={1} Source={2} OpenedWithinLookback={3} NeedsAction={4}" -f $s.Browser, $t, $s.Source, $s.OpenedWithinLookback, $s.NeedsAction)
   }
 
-  $openedRecently = $false
-  foreach ($s in $status) {
-    if ($s.OpenedWithinLookback) { $openedRecently = $true; break }
-  }
-
-  if ($openedRecently) {
+  $toNudge = @($status | Where-Object { $_.NeedsAction })
+  if (-not $toNudge -or $toNudge.Count -eq 0) {
     Write-Host ""
-    Write-Host "Result: At least one installed browser was opened within the lookback window. No action taken."
+    Write-Host "Result: All installed browsers were opened within the lookback window. No action taken."
     exit 0
   }
 
   Write-Host ""
-  Write-Host "Result: No installed browser was detected as opened within the lookback window."
+  Write-Host "Result: The following browsers were NOT opened within the lookback window and will be nudged:"
+  foreach ($x in $toNudge) { Write-Host ("- {0}" -f $x.Browser) }
 
-  $toLaunch = $installed | Select-Object -First 1
   if ($ReportOnly) {
-    Write-Host ("ReportOnly: Would launch {0} for {1} seconds then close." -f $toLaunch.Name, $OpenSeconds)
+    Write-Host ("ReportOnly: Would launch each above browser for {0} seconds then close." -f $OpenSeconds)
     exit 2
   }
 
-  # Record existing PIDs per process name so we only close what we start
-  $existingPids = @{}
-  foreach ($pn in $toLaunch.ProcNames) {
-    $existingPids[$pn] = @(Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+  $didAny = $false
+
+  foreach ($x in $toNudge) {
+    $browser = $installed | Where-Object { $_.Name -eq $x.Browser } | Select-Object -First 1
+    if (-not $browser) { continue }
+
+    $existingPids = @{}
+    foreach ($pn in $browser.ProcNames) {
+      $existingPids[$pn] = @(Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    }
+
+    $launchTime = Get-Date
+    $args = Get-LaunchArgs -BrowserName $browser.Name -Url $Url
+
+    Write-Host ""
+    Write-Host ("Launching {0} for {1} seconds..." -f $browser.Name, $OpenSeconds)
+
+    if ($PSCmdlet.ShouldProcess($browser.Name, "Launch and close after delay")) {
+      Start-Process -FilePath $browser.ExePath -ArgumentList $args | Out-Null
+      Start-Sleep -Seconds $OpenSeconds
+      Write-Host ("Closing newly-started {0} processes..." -f $browser.Name)
+      Close-NewProcesses -ProcNames $browser.ProcNames -ExistingPidsByName $existingPids -LaunchTime $launchTime
+      $didAny = $true
+    }
   }
 
-  $launchTime = Get-Date
-  Write-Host ("Launching {0} to {1}..." -f $toLaunch.Name, $Url)
-
-  if ($PSCmdlet.ShouldProcess($toLaunch.Name, "Launch and close after delay")) {
-    Start-Process -FilePath $toLaunch.ExePath -ArgumentList $Url | Out-Null
-    Start-Sleep -Seconds $OpenSeconds
-    Write-Host "Closing newly-started browser processes..."
-    Close-NewProcesses -ProcNames $toLaunch.ProcNames -ExistingPidsByName $existingPids -LaunchTime $launchTime
-  }
-
+  Write-Host ""
   Write-Host "Done."
-  exit 1
+  if ($didAny) { exit 1 } else { exit 0 }
 }
 catch {
   Write-Error $_
