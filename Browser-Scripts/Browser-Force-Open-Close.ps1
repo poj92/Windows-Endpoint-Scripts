@@ -3,22 +3,21 @@
 Browser-Force-Open-Close.ps1
 
 Checks whether ANY installed browser has been opened within the last N hours.
-If not, launches an installed browser and closes only the newly started processes after a delay.
+If not, launches one installed browser and closes only newly started processes after a delay.
 
-Installed browser detection:
-- Known paths
-- App Paths registry
-- Uninstall registry entries (DisplayName / DisplayIcon / InstallLocation)
+Installed browser detection (SYSTEM-friendly):
+- Known machine paths (Program Files / Program Files (x86))
+- App Paths registry (HKLM + HKLM\WOW6432Node + HKCU)
 
-"Opened within lookback" detection:
-- Prefetch last-write time for browser EXE name (best signal when available)
-- Fallback: currently running browser processes whose StartTime is within lookback (best-effort)
+Last-open detection:
+- Prefetch last write time for the browser EXE name (best signal)
+- Fallback: currently running browser processes with StartTime within lookback
 
 Exit codes:
   0 = at least one installed browser opened within lookback (no action)
   1 = none opened; script launched and then closed a browser
   2 = ReportOnly and launch would have occurred
-  3 = no supported browser installed (nothing to do)
+  3 = no supported browser installed
   4 = error
 #>
 
@@ -28,136 +27,35 @@ param(
   [int]$OpenSeconds = 120,
   [string]$Url = 'about:blank',
   [switch]$ReportOnly,
-
-  [ValidateSet('Edge','Chrome','Firefox','Brave','Opera')]
   [string[]]$Preference = @('Edge','Chrome','Firefox','Brave','Opera')
 )
 
-Set-StrictMode -Version Latest
+Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-function Get-BrowserMeta {
-  param([Parameter(Mandatory)][string]$Name)
-  switch ($Name) {
-    'Edge'    { @{ Name='Edge';    Proc='msedge';  Exe='msedge.exe'  ; Known=@("$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe",
-                                                                               "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe") } }
-    'Chrome'  { @{ Name='Chrome';  Proc='chrome';  Exe='chrome.exe'  ; Known=@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
-                                                                               "$env:ProgramFiles (x86)\Google\Chrome\Application\chrome.exe") } }
-    'Firefox' { @{ Name='Firefox'; Proc='firefox'; Exe='firefox.exe' ; Known=@("$env:ProgramFiles\Mozilla Firefox\firefox.exe",
-                                                                               "$env:ProgramFiles (x86)\Mozilla Firefox\firefox.exe") } }
-    'Brave'   { @{ Name='Brave';   Proc='brave';   Exe='brave.exe'   ; Known=@("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
-                                                                               "$env:ProgramFiles (x86)\BraveSoftware\Brave-Browser\Application\brave.exe") } }
-    'Opera'   { @{ Name='Opera';   Proc='opera';   Exe='launcher.exe'; Known=@("$env:ProgramFiles\Opera\launcher.exe",
-                                                                               "$env:ProgramFiles (x86)\Opera\launcher.exe",
-                                                                               "$env:LOCALAPPDATA\Programs\Opera\launcher.exe") } }
-    default { throw "Unknown browser name: $Name" }
-  }
-}
-
-function Get-AppPathsExe {
+function Get-AppPathExe {
   param([Parameter(Mandatory)][string]$ExeName)
 
-  $keys = @(
-    "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
-    "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
-    "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName"
+  # Read default value from App Paths using .NET registry APIs (works across PS versions)
+  $subKeys = @(
+    "SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\$ExeName",
+    "SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\$ExeName"
   )
 
-  foreach ($k in $keys) {
-    try {
-      if (Test-Path $k) {
-        $val = (Get-ItemProperty -Path $k -ErrorAction Stop).'(default)'
-        if ($val -and (Test-Path $val)) { return $val }
-      }
-    } catch { }
-  }
-  return $null
-}
-
-function Get-UninstallEntries {
-  $paths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
-    'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
-    'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*'
-  )
-
-  foreach ($p in $paths) {
-    Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
-      Where-Object {
-        # Defensive: only require DisplayName; ignore SystemComponent if missing
-        $_.PSObject.Properties.Match('DisplayName').Count -gt 0 -and
-        $_.DisplayName -and
-        (($_.PSObject.Properties.Match('SystemComponent').Count -eq 0) -or ($_.SystemComponent -ne 1))
-      } |
-      ForEach-Object {
-        [pscustomobject]@{
-          DisplayName     = $_.DisplayName
-          DisplayIcon     = (if ($_.PSObject.Properties.Match('DisplayIcon').Count -gt 0) { $_.DisplayIcon } else { $null })
-          InstallLocation = (if ($_.PSObject.Properties.Match('InstallLocation').Count -gt 0) { $_.InstallLocation } else { $null })
+  foreach ($root in @([Microsoft.Win32.Registry]::LocalMachine, [Microsoft.Win32.Registry]::CurrentUser)) {
+    foreach ($sub in $subKeys) {
+      try {
+        $k = $root.OpenSubKey($sub)
+        if ($k) {
+          $val = $k.GetValue('')
+          $k.Close()
+          if ($val -and (Test-Path $val)) { return $val }
         }
-      }
-  }
-}
-
-function Clean-DisplayIconPath {
-  param([string]$DisplayIcon)
-  if (-not $DisplayIcon) { return $null }
-  $s = $DisplayIcon.Trim()
-
-  if ($s.StartsWith('"') -and $s.EndsWith('"')) {
-    $s = $s.Trim('"')
+      } catch { }
+    }
   }
 
-  # Strip icon index after comma
-  $s = ($s -split ',')[0].Trim()
-
-  if ($s -and (Test-Path $s)) { return $s }
   return $null
-}
-
-function Find-InstalledBrowsers {
-  param([string[]]$Names)
-
-  $uninstall = @(Get-UninstallEntries)
-  $installed = @()
-
-  foreach ($name in $Names) {
-    $m = Get-BrowserMeta -Name $name
-
-    # 1) Known paths
-    $exePath = $null
-    foreach ($p in $m.Known) {
-      if ($p -and (Test-Path $p)) { $exePath = $p; break }
-    }
-
-    # 2) App Paths
-    if (-not $exePath) {
-      $exePath = Get-AppPathsExe -ExeName $m.Exe
-    }
-
-    # 3) Uninstall entries heuristics
-    if (-not $exePath) {
-      $hits = $uninstall | Where-Object { $_.DisplayName -match $m.Name }
-      foreach ($h in $hits) {
-        $icon = Clean-DisplayIconPath -DisplayIcon $h.DisplayIcon
-        if ($icon) { $exePath = $icon; break }
-        if ($h.InstallLocation) {
-          $candidate = Join-Path $h.InstallLocation $m.Exe
-          if (Test-Path $candidate) { $exePath = $candidate; break }
-        }
-      }
-    }
-
-    if ($exePath) {
-      $installed += [pscustomobject]@{
-        Name     = $m.Name
-        ProcName = $m.Proc
-        ExePath  = $exePath
-      }
-    }
-  }
-
-  $installed | Sort-Object Name -Unique
 }
 
 function Get-PrefetchLastRun {
@@ -175,21 +73,89 @@ function Get-PrefetchLastRun {
 
 function Get-ProcessLastRunFallback {
   param(
-    [Parameter(Mandatory)][string]$ProcName,
+    [Parameter(Mandatory)][string[]]$ProcNames,
     [Parameter(Mandatory)][datetime]$Cutoff
   )
 
-  $procs = Get-Process -Name $ProcName -ErrorAction SilentlyContinue
-  if (-not $procs) { return $null }
-
-  $times = foreach ($p in $procs) {
-    try {
-      if ($p.StartTime -ge $Cutoff) { $p.StartTime }
-    } catch { }
+  $times = @()
+  foreach ($pn in $ProcNames) {
+    $procs = Get-Process -Name $pn -ErrorAction SilentlyContinue
+    foreach ($p in $procs) {
+      try {
+        if ($p.StartTime -ge $Cutoff) { $times += $p.StartTime }
+      } catch { }
+    }
   }
 
-  if (-not $times) { return $null }
+  if (-not $times -or $times.Count -eq 0) { return $null }
   ($times | Sort-Object -Descending | Select-Object -First 1)
+}
+
+function Find-InstalledBrowsers {
+  # Define supported browsers (machine-wide paths + app paths)
+  $defs = @(
+    @{
+      Name='Edge';    ProcNames=@('msedge');  AppExe='msedge.exe';  PrefetchBases=@('msedge');
+      Candidates=@("$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+                   "$env:ProgramFiles (x86)\Microsoft\Edge\Application\msedge.exe")
+    },
+    @{
+      Name='Chrome';  ProcNames=@('chrome');  AppExe='chrome.exe';  PrefetchBases=@('chrome');
+      Candidates=@("$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+                   "$env:ProgramFiles (x86)\Google\Chrome\Application\chrome.exe")
+    },
+    @{
+      Name='Firefox'; ProcNames=@('firefox'); AppExe='firefox.exe'; PrefetchBases=@('firefox');
+      Candidates=@("$env:ProgramFiles\Mozilla Firefox\firefox.exe",
+                   "$env:ProgramFiles (x86)\Mozilla Firefox\firefox.exe")
+    },
+    @{
+      Name='Brave';   ProcNames=@('brave');   AppExe='brave.exe';   PrefetchBases=@('brave');
+      Candidates=@("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
+                   "$env:ProgramFiles (x86)\BraveSoftware\Brave-Browser\Application\brave.exe")
+    },
+    @{
+      # Opera typically launches via launcher.exe but spawns opera.exe
+      Name='Opera';   ProcNames=@('opera','launcher'); AppExe='launcher.exe'; PrefetchBases=@('opera','launcher');
+      Candidates=@("$env:ProgramFiles\Opera\launcher.exe",
+                   "$env:ProgramFiles (x86)\Opera\launcher.exe")
+    }
+  )
+
+  $installed = @()
+
+  foreach ($b in $defs) {
+    $exePath = $null
+
+    foreach ($c in $b.Candidates) {
+      if ($c -and (Test-Path $c)) { $exePath = $c; break }
+    }
+
+    if (-not $exePath) {
+      $exePath = Get-AppPathExe -ExeName $b.AppExe
+    }
+
+    if ($exePath) {
+      $installed += [pscustomobject]@{
+        Name = $b.Name
+        ExePath = $exePath
+        ProcNames = $b.ProcNames
+        PrefetchBases = $b.PrefetchBases
+      }
+    }
+  }
+
+  # Order by preference
+  $ordered = @()
+  foreach ($p in $Preference) {
+    $hit = $installed | Where-Object { $_.Name -eq $p } | Select-Object -First 1
+    if ($hit) { $ordered += $hit }
+  }
+  foreach ($x in $installed) {
+    if (-not ($ordered | Where-Object { $_.Name -eq $x.Name })) { $ordered += $x }
+  }
+
+  return $ordered
 }
 
 function Get-LastOpenStatus {
@@ -198,58 +164,76 @@ function Get-LastOpenStatus {
     [Parameter(Mandatory)][datetime]$Cutoff
   )
 
+  $status = @()
+
   foreach ($b in $InstalledBrowsers) {
+    $prefetchTimes = @()
+    foreach ($base in $b.PrefetchBases) {
+      $t = $null
+      try { $t = Get-PrefetchLastRun -ExeBaseName $base } catch { $t = $null }
+      if ($t) { $prefetchTimes += $t }
+    }
+
     $prefetchTime = $null
-    try { $prefetchTime = Get-PrefetchLastRun -ExeBaseName $b.ProcName } catch { $prefetchTime = $null }
+    if ($prefetchTimes.Count -gt 0) {
+      $prefetchTime = ($prefetchTimes | Sort-Object -Descending | Select-Object -First 1)
+    }
 
     $fallbackTime = $null
     if (-not $prefetchTime) {
-      $fallbackTime = Get-ProcessLastRunFallback -ProcName $b.ProcName -Cutoff $Cutoff
+      $fallbackTime = Get-ProcessLastRunFallback -ProcNames $b.ProcNames -Cutoff $Cutoff
     }
 
-    $last = if ($prefetchTime) { $prefetchTime } else { $fallbackTime }
+    $last = $prefetchTime
+    $source = 'Prefetch'
+    if (-not $last) { $last = $fallbackTime; $source = 'ProcessStartTime' }
+    if (-not $last) { $source = 'None' }
 
-    [pscustomobject]@{
-      Browser    = $b.Name
-      ProcName   = $b.ProcName
-      ExePath    = $b.ExePath
+    $status += [pscustomobject]@{
+      Browser = $b.Name
+      ExePath = $b.ExePath
+      ProcNames = $b.ProcNames
       LastOpened = $last
-      Source     = if ($prefetchTime) { 'Prefetch' } elseif ($fallbackTime) { 'ProcessStartTime' } else { 'None' }
+      Source = $source
       OpenedWithinLookback = [bool]($last -and $last -ge $Cutoff)
     }
   }
+
+  return $status
 }
 
-function Start-Browser {
-  param([Parameter(Mandatory)][string]$ExePath, [Parameter(Mandatory)][string]$Url)
-  Start-Process -FilePath $ExePath -ArgumentList $Url -PassThru
-}
-
-function Close-NewBrowserProcesses {
+function Close-NewProcesses {
   param(
-    [Parameter(Mandatory)][string]$ProcessName,
-    [Parameter(Mandatory)][int[]]$ExistingPids,
+    [Parameter(Mandatory)][string[]]$ProcNames,
+    [Parameter(Mandatory)][hashtable]$ExistingPidsByName,
     [Parameter(Mandatory)][datetime]$LaunchTime
   )
 
-  $procs = Get-Process -Name $ProcessName -ErrorAction SilentlyContinue
-  if (-not $procs) { return }
+  $newProcs = @()
 
-  $newProcs = foreach ($p in $procs) {
-    if ($ExistingPids -contains $p.Id) { continue }
+  foreach ($pn in $ProcNames) {
+    $existing = @()
+    if ($ExistingPidsByName.ContainsKey($pn)) { $existing = $ExistingPidsByName[$pn] }
 
-    $ok = $true
-    try {
-      if ($p.StartTime -lt $LaunchTime.AddSeconds(-5)) { $ok = $false }
-    } catch {
+    $procs = Get-Process -Name $pn -ErrorAction SilentlyContinue
+    foreach ($p in $procs) {
+      if ($existing -contains $p.Id) { continue }
+
       $ok = $true
-    }
+      try {
+        if ($p.StartTime -lt $LaunchTime.AddSeconds(-5)) { $ok = $false }
+      } catch {
+        # If StartTime not accessible, still treat as potentially new (best-effort)
+        $ok = $true
+      }
 
-    if ($ok) { $p }
+      if ($ok) { $newProcs += $p }
+    }
   }
 
-  if (-not $newProcs) { return }
+  if (-not $newProcs -or $newProcs.Count -eq 0) { return }
 
+  # Graceful close first
   foreach ($p in $newProcs) {
     try {
       if ($p.MainWindowHandle -ne 0) { [void]$p.CloseMainWindow() }
@@ -258,10 +242,9 @@ function Close-NewBrowserProcesses {
 
   Start-Sleep -Seconds 10
 
+  # Force close leftovers
   foreach ($p in $newProcs) {
-    try {
-      if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-    } catch { }
+    try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch { }
   }
 }
 
@@ -269,7 +252,7 @@ function Close-NewBrowserProcesses {
 try {
   $cutoff = (Get-Date).AddHours(-[double]$LookbackHours)
 
-  $installed = Find-InstalledBrowsers -Names $Preference
+  $installed = Find-InstalledBrowsers
   if (-not $installed -or $installed.Count -eq 0) {
     Write-Host "No supported browsers found installed on this machine."
     exit 3
@@ -277,18 +260,25 @@ try {
 
   Write-Host ("Lookback window: last {0} hours (since {1})" -f $LookbackHours, $cutoff)
   Write-Host "Installed browsers detected:"
-  foreach ($b in $installed) { Write-Host ("- {0} ({1}) => {2}" -f $b.Name, $b.ProcName, $b.ExePath) }
+  foreach ($b in $installed) {
+    Write-Host ("- {0} => {1}" -f $b.Name, $b.ExePath)
+  }
 
-  $status = @(Get-LastOpenStatus -InstalledBrowsers $installed -Cutoff $cutoff)
+  $status = Get-LastOpenStatus -InstalledBrowsers $installed -Cutoff $cutoff
 
   Write-Host ""
   Write-Host "Last-open status:"
   foreach ($s in $status) {
-    $t = if ($s.LastOpened) { $s.LastOpened.ToString('yyyy-MM-dd HH:mm:ss') } else { '<unknown>' }
+    $t = '<unknown>'
+    if ($s.LastOpened) { $t = $s.LastOpened.ToString('yyyy-MM-dd HH:mm:ss') }
     Write-Host ("{0}: LastOpened={1} Source={2} OpenedWithinLookback={3}" -f $s.Browser, $t, $s.Source, $s.OpenedWithinLookback)
   }
 
-  $openedRecently = [bool]($status | Where-Object { $_.OpenedWithinLookback } | Select-Object -First 1)
+  $openedRecently = $false
+  foreach ($s in $status) {
+    if ($s.OpenedWithinLookback) { $openedRecently = $true; break }
+  }
+
   if ($openedRecently) {
     Write-Host ""
     Write-Host "Result: At least one installed browser was opened within the lookback window. No action taken."
@@ -298,29 +288,26 @@ try {
   Write-Host ""
   Write-Host "Result: No installed browser was detected as opened within the lookback window."
 
-  # Choose what to launch: first installed in preference order
-  $toLaunch = $null
-  foreach ($pref in $Preference) {
-    $hit = $installed | Where-Object { $_.Name -eq $pref } | Select-Object -First 1
-    if ($hit) { $toLaunch = $hit; break }
-  }
-  if (-not $toLaunch) { $toLaunch = $installed | Select-Object -First 1 }
-
+  $toLaunch = $installed | Select-Object -First 1
   if ($ReportOnly) {
-    Write-Host ("ReportOnly: Would launch {0} ({1}) for {2} seconds then close." -f $toLaunch.Name, $toLaunch.ExePath, $OpenSeconds)
+    Write-Host ("ReportOnly: Would launch {0} for {1} seconds then close." -f $toLaunch.Name, $OpenSeconds)
     exit 2
   }
 
-  $existing = @(Get-Process -Name $toLaunch.ProcName -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-  $launchTime = Get-Date
+  # Record existing PIDs per process name so we only close what we start
+  $existingPids = @{}
+  foreach ($pn in $toLaunch.ProcNames) {
+    $existingPids[$pn] = @(Get-Process -Name $pn -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+  }
 
+  $launchTime = Get-Date
   Write-Host ("Launching {0} to {1}..." -f $toLaunch.Name, $Url)
 
   if ($PSCmdlet.ShouldProcess($toLaunch.Name, "Launch and close after delay")) {
-    [void](Start-Browser -ExePath $toLaunch.ExePath -Url $Url)
+    Start-Process -FilePath $toLaunch.ExePath -ArgumentList $Url | Out-Null
     Start-Sleep -Seconds $OpenSeconds
-    Write-Host ("Closing newly-started {0} processes..." -f $toLaunch.ProcName)
-    Close-NewBrowserProcesses -ProcessName $toLaunch.ProcName -ExistingPids $existing -LaunchTime $launchTime
+    Write-Host "Closing newly-started browser processes..."
+    Close-NewProcesses -ProcNames $toLaunch.ProcNames -ExistingPidsByName $existingPids -LaunchTime $launchTime
   }
 
   Write-Host "Done."
