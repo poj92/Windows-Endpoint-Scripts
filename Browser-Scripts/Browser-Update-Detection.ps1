@@ -6,6 +6,7 @@
     Browser-Update-Detection.ps1
     Detects when browsers have pending updates that require a restart to apply.
 
+    Script must be run as system.
 #>
 
 $ErrorActionPreference = 'Stop'

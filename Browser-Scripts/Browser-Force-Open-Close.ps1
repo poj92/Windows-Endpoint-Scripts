@@ -1,13 +1,18 @@
 #Requires -Version 5.1
 <#
-Author: Peter Opeyemi James
+Browser-Force-Open-Close.ps1
 
 Checks whether ANY installed browser has been opened within the last N hours.
-If not, launches a browser and closes only the newly started browser processes after a delay.
+If not, launches an installed browser and closes only the newly started processes after a delay.
 
-Detection:
-- Installed browsers: checks known paths + App Paths + Uninstall registry entries.
-- "Opened within lookback": uses Prefetch last-write time when available; else falls back to currently running process start time.
+Installed browser detection:
+- Known paths
+- App Paths registry
+- Uninstall registry entries (DisplayName / DisplayIcon / InstallLocation)
+
+"Opened within lookback" detection:
+- Prefetch last-write time for browser EXE name (best signal when available)
+- Fallback: currently running browser processes whose StartTime is within lookback (best-effort)
 
 Exit codes:
   0 = at least one installed browser opened within lookback (no action)
@@ -24,7 +29,6 @@ param(
   [string]$Url = 'about:blank',
   [switch]$ReportOnly,
 
-  # Preference order when choosing what to open (only those installed are used)
   [ValidateSet('Edge','Chrome','Firefox','Brave','Opera')]
   [string[]]$Preference = @('Edge','Chrome','Firefox','Brave','Opera')
 )
@@ -43,7 +47,7 @@ function Get-BrowserMeta {
                                                                                "$env:ProgramFiles (x86)\Mozilla Firefox\firefox.exe") } }
     'Brave'   { @{ Name='Brave';   Proc='brave';   Exe='brave.exe'   ; Known=@("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
                                                                                "$env:ProgramFiles (x86)\BraveSoftware\Brave-Browser\Application\brave.exe") } }
-    'Opera'   { @{ Name='Opera';   Proc='opera';   Exe='opera.exe'   ; Known=@("$env:ProgramFiles\Opera\launcher.exe",
+    'Opera'   { @{ Name='Opera';   Proc='opera';   Exe='launcher.exe'; Known=@("$env:ProgramFiles\Opera\launcher.exe",
                                                                                "$env:ProgramFiles (x86)\Opera\launcher.exe",
                                                                                "$env:LOCALAPPDATA\Programs\Opera\launcher.exe") } }
     default { throw "Unknown browser name: $Name" }
@@ -79,12 +83,17 @@ function Get-UninstallEntries {
 
   foreach ($p in $paths) {
     Get-ItemProperty -Path $p -ErrorAction SilentlyContinue |
-      Where-Object { $_.DisplayName -and -not $_.SystemComponent } |
+      Where-Object {
+        # Defensive: only require DisplayName; ignore SystemComponent if missing
+        $_.PSObject.Properties.Match('DisplayName').Count -gt 0 -and
+        $_.DisplayName -and
+        (($_.PSObject.Properties.Match('SystemComponent').Count -eq 0) -or ($_.SystemComponent -ne 1))
+      } |
       ForEach-Object {
         [pscustomobject]@{
           DisplayName     = $_.DisplayName
-          DisplayIcon     = $_.DisplayIcon
-          InstallLocation = $_.InstallLocation
+          DisplayIcon     = (if ($_.PSObject.Properties.Match('DisplayIcon').Count -gt 0) { $_.DisplayIcon } else { $null })
+          InstallLocation = (if ($_.PSObject.Properties.Match('InstallLocation').Count -gt 0) { $_.InstallLocation } else { $null })
         }
       }
   }
@@ -95,11 +104,13 @@ function Clean-DisplayIconPath {
   if (-not $DisplayIcon) { return $null }
   $s = $DisplayIcon.Trim()
 
-  # Strip surrounding quotes and ",0" or ",1" icon index
-  if ($s.StartsWith('"') -and $s.Contains('"')) {
+  if ($s.StartsWith('"') -and $s.EndsWith('"')) {
     $s = $s.Trim('"')
   }
+
+  # Strip icon index after comma
   $s = ($s -split ',')[0].Trim()
+
   if ($s -and (Test-Path $s)) { return $s }
   return $null
 }
@@ -108,7 +119,6 @@ function Find-InstalledBrowsers {
   param([string[]]$Names)
 
   $uninstall = @(Get-UninstallEntries)
-
   $installed = @()
 
   foreach ($name in $Names) {
@@ -125,7 +135,7 @@ function Find-InstalledBrowsers {
       $exePath = Get-AppPathsExe -ExeName $m.Exe
     }
 
-    # 3) Uninstall entries (DisplayIcon / InstallLocation heuristics)
+    # 3) Uninstall entries heuristics
     if (-not $exePath) {
       $hits = $uninstall | Where-Object { $_.DisplayName -match $m.Name }
       foreach ($h in $hits) {
@@ -147,7 +157,6 @@ function Find-InstalledBrowsers {
     }
   }
 
-  # Unique by Name
   $installed | Sort-Object Name -Unique
 }
 
@@ -189,7 +198,7 @@ function Get-LastOpenStatus {
     [Parameter(Mandatory)][datetime]$Cutoff
   )
 
-  $status = foreach ($b in $InstalledBrowsers) {
+  foreach ($b in $InstalledBrowsers) {
     $prefetchTime = $null
     try { $prefetchTime = Get-PrefetchLastRun -ExeBaseName $b.ProcName } catch { $prefetchTime = $null }
 
@@ -199,6 +208,7 @@ function Get-LastOpenStatus {
     }
 
     $last = if ($prefetchTime) { $prefetchTime } else { $fallbackTime }
+
     [pscustomobject]@{
       Browser    = $b.Name
       ProcName   = $b.ProcName
@@ -208,15 +218,10 @@ function Get-LastOpenStatus {
       OpenedWithinLookback = [bool]($last -and $last -ge $Cutoff)
     }
   }
-
-  $status
 }
 
 function Start-Browser {
-  param(
-    [Parameter(Mandatory)][string]$ExePath,
-    [Parameter(Mandatory)][string]$Url
-  )
+  param([Parameter(Mandatory)][string]$ExePath, [Parameter(Mandatory)][string]$Url)
   Start-Process -FilePath $ExePath -ArgumentList $Url -PassThru
 }
 
@@ -245,7 +250,6 @@ function Close-NewBrowserProcesses {
 
   if (-not $newProcs) { return }
 
-  # Graceful close
   foreach ($p in $newProcs) {
     try {
       if ($p.MainWindowHandle -ne 0) { [void]$p.CloseMainWindow() }
@@ -254,12 +258,9 @@ function Close-NewBrowserProcesses {
 
   Start-Sleep -Seconds 10
 
-  # Force close leftovers
   foreach ($p in $newProcs) {
     try {
-      if (-not $p.HasExited) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-      }
+      if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
     } catch { }
   }
 }
@@ -276,11 +277,9 @@ try {
 
   Write-Host ("Lookback window: last {0} hours (since {1})" -f $LookbackHours, $cutoff)
   Write-Host "Installed browsers detected:"
-  foreach ($b in $installed) {
-    Write-Host ("- {0} ({1}) => {2}" -f $b.Name, $b.ProcName, $b.ExePath)
-  }
+  foreach ($b in $installed) { Write-Host ("- {0} ({1}) => {2}" -f $b.Name, $b.ProcName, $b.ExePath) }
 
-  $status = Get-LastOpenStatus -InstalledBrowsers $installed -Cutoff $cutoff
+  $status = @(Get-LastOpenStatus -InstalledBrowsers $installed -Cutoff $cutoff)
 
   Write-Host ""
   Write-Host "Last-open status:"
@@ -312,10 +311,9 @@ try {
     exit 2
   }
 
-  # Record existing PIDs for that browser
   $existing = @(Get-Process -Name $toLaunch.ProcName -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
-
   $launchTime = Get-Date
+
   Write-Host ("Launching {0} to {1}..." -f $toLaunch.Name, $Url)
 
   if ($PSCmdlet.ShouldProcess($toLaunch.Name, "Launch and close after delay")) {
