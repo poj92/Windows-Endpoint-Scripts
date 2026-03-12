@@ -1,6 +1,10 @@
 <#
     This PowerShell script checks whether the ConnectSecure agent is installed and if not,
     it will run the installer from the same directory as this script.
+
+    Remember to have the ConnectSecure-Install.ps1 script in the same directory as this script for it to work properly.
+    Content of ConnectSecure-Install.ps1 should handle the actual installation process of the ConnectSecure agent for the 
+    respective customer.
 #>
 
 # Check if ConnectSecure agent is installed
