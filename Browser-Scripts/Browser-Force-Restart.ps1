@@ -1,4 +1,14 @@
 #Requires -Version 5.1
+<#
+    Author: Peter Opeyemi James
+    
+    Browser-Force-Restart.ps1
+    Checks for browsers that have pending updates that require a restart to apply.
+    Shows a notification to the user that a restart is required, with a countdown and options to postpone.
+    If the user chooses to restart or the countdown expires, attempts to gracefully restart the browser, and forcefully if needed.
+    Logs all actions and decisions to a log file for auditing and troubleshooting purposes.
+#>
+
 param(
     [string]$ScheduledTaskName
 )

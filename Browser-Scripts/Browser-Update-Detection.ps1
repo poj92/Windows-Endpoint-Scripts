@@ -1,4 +1,13 @@
 #Requires -Version 5.1
+
+<#
+    Author: Peter Opeyemi James
+    
+    Browser-Update-Detection.ps1
+    Detects when browsers have pending updates that require a restart to apply.
+
+#>
+
 $ErrorActionPreference = 'Stop'
 
 # =========================
