@@ -14,17 +14,16 @@ Exit codes:
   2 = updates found but none installed (e.g., only reboot-requiring updates and IncludeRebootUpdates not set)
   3 = error
 #>
-
+#Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [int]$CountdownMinutes = 10,
   [int[]]$PostponeOptionsMinutes = @(30, 60, 120),
-
-  # If set, also installs updates that may/always require reboot.
-  # Default: install only NeverReboots.
   [switch]$IncludeRebootUpdates,
-
   [switch]$ReportOnly,
+
+  # Message heading/title requested
+  [string]$UiTitle = "A security message from Nexus Open Systems Ltd",
 
   [string]$Reason = "Windows updates require a restart to finish installing."
 )
@@ -58,37 +57,47 @@ function Test-PendingReboot {
   return $false
 }
 
-function Get-ActiveConsoleUser {
-  # Prefer Win32_ComputerSystem.UserName (simple + reliable)
-  try {
-    $u = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
-    if ($u) { return $u }
-  } catch { }
-
-  # Fallback: parse quser for Active
+function Get-ActiveSessionInfo {
+  # Returns @{ User = 'DOMAIN\User'; SessionId = 1 } or $null
   try {
     $out = & quser 2>$null
-    if ($out) {
-      foreach ($l in $out) {
-        if ($l -match '\sActive\s') {
-          # crude parse; last token may be session name, so just return something non-null
-          return $null
-        }
+    if (-not $out) { return $null }
+
+    foreach ($line in $out) {
+      # Typical:
+      # >username         sessionname      1  Active      ...
+      # username          console          1  Active      ...
+      $l = $line.Trim()
+      if ($l -match '^(>?)(\S+)\s+(\S+)\s+(\d+)\s+Active\s') {
+        $user = $Matches[2]
+        $sid  = [int]$Matches[4]
+        # Try to expand to DOMAIN\User via Win32_ComputerSystem.UserName if available
+        try {
+          $csUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue).UserName
+          if ($csUser -and ($csUser -match "\\$user$")) {
+            return @{ User = $csUser; SessionId = $sid }
+          }
+        } catch { }
+        return @{ User = $user; SessionId = $sid }
       }
     }
   } catch { }
 
-  return $null
-}
-
-function Get-ActiveSessionPresent {
+  # Fallback: explorer.exe owner in any session
   try {
-    $out = & quser 2>$null
-    if ($out) {
-      foreach ($l in $out) { if ($l -match '\sActive\s') { return $true } }
+    $explorers = Get-CimInstance Win32_Process -Filter "Name='explorer.exe'" -ErrorAction SilentlyContinue
+    foreach ($p in $explorers) {
+      try {
+        $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+        if ($o -and $o.User) {
+          $user = if ($o.Domain) { ($o.Domain + "\" + $o.User) } else { $o.User }
+          return @{ User = $user; SessionId = [int]$p.SessionId }
+        }
+      } catch { }
     }
   } catch { }
-  return $false
+
+  return $null
 }
 
 function Send-UserMessage([string]$Text) {
@@ -99,6 +108,7 @@ function New-RebootPromptHelperScript {
   param(
     [int]$CountdownMinutes,
     [int[]]$PostponeOptionsMinutes,
+    [string]$UiTitle,
     [string]$Reason
   )
 
@@ -112,6 +122,9 @@ function New-RebootPromptHelperScript {
 param(
   [int]`$CountdownMinutes = $CountdownMinutes,
   [string]`$PostponeCsv = '$optsCsv',
+  [string]`$UiTitle = @'
+$UiTitle
+'@,
   [string]`$Reason = @'
 $Reason
 '@
@@ -125,42 +138,35 @@ function Schedule-Reboot([int]`$Seconds, [string]`$Msg) {
   & shutdown.exe /r /t `$Seconds /c `$Msg | Out-Null
 }
 
+# Parse postpone options
 `$PostponeOptionsMinutes = @()
 if (`$PostponeCsv) {
-  foreach (`$x in (`$PostponeCsv -split ',')) {
-    try { `$PostponeOptionsMinutes += [int]`$x } catch { }
-  }
+  foreach (`$x in (`$PostponeCsv -split ',')) { try { `$PostponeOptionsMinutes += [int]`$x } catch { } }
 }
-if (-not `$PostponeOptionsMinutes -or `$PostponeOptionsMinutes.Count -eq 0) {
-  `$PostponeOptionsMinutes = @(30,60,120)
-}
+if (-not `$PostponeOptionsMinutes -or `$PostponeOptionsMinutes.Count -eq 0) { `$PostponeOptionsMinutes = @(30,60,120) }
 
-# Ensure reboot happens even if UI is ignored
+# Schedule initial reboot so it still happens if user ignores the UI
 `$deadline = (Get-Date).AddMinutes([double]`$CountdownMinutes)
-Schedule-Reboot -Seconds ([int](`$CountdownMinutes*60)) -Msg ("`$Reason Computer will reboot in `$CountdownMinutes minute(s).")
+Schedule-Reboot -Seconds ([int](`$CountdownMinutes*60)) -Msg ("`$Reason This computer will reboot in `$CountdownMinutes minute(s).")
 
 `$form = New-Object System.Windows.Forms.Form
-`$form.Text = 'Restart required'
-`$form.Size = New-Object System.Drawing.Size(600, 240)
+`$form.Text = `$UiTitle
+`$form.Size = New-Object System.Drawing.Size(640, 260)
 `$form.StartPosition = 'CenterScreen'
 `$form.TopMost = `$true
 
-`$form.Add_FormClosing({
-  if (`$_.CloseReason -eq 'UserClosing') { `$_.Cancel = `$true }
-})
-
 `$label1 = New-Object System.Windows.Forms.Label
 `$label1.AutoSize = `$true
-`$label1.MaximumSize = New-Object System.Drawing.Size(560, 0)
+`$label1.MaximumSize = New-Object System.Drawing.Size(600, 0)
 `$label1.Location = New-Object System.Drawing.Point(18, 18)
 `$label1.Font = New-Object System.Drawing.Font('Segoe UI', 10)
-`$label1.Text = `$Reason
+`$label1.Text = `$Reason + ' This computer will reboot in $CountdownMinutes minutes.'
 `$form.Controls.Add(`$label1)
 
 `$label2 = New-Object System.Windows.Forms.Label
 `$label2.AutoSize = `$true
 `$label2.Location = New-Object System.Drawing.Point(18, 70)
-`$label2.Font = New-Object System.Drawing.Font('Segoe UI', 11, [System.Drawing.FontStyle]::Bold)
+`$label2.Font = New-Object System.Drawing.Font('Segoe UI', 12, [System.Drawing.FontStyle]::Bold)
 `$form.Controls.Add(`$label2)
 
 function Update-Countdown {
@@ -174,7 +180,7 @@ function Update-Countdown {
   }
   `$mins = [int][Math]::Floor(`$remain.TotalMinutes)
   `$secs = [int]`$remain.Seconds
-  `$label2.Text = ('Computer will reboot in {0:00}:{1:00}' -f `$mins, `$secs)
+  `$label2.Text = ('Time remaining: {0:00}:{1:00}' -f `$mins, `$secs)
 }
 
 `$timer = New-Object System.Windows.Forms.Timer
@@ -183,37 +189,53 @@ function Update-Countdown {
 `$timer.Start()
 Update-Countdown
 
+# Dropdown for postpone options
+`$combo = New-Object System.Windows.Forms.ComboBox
+`$combo.DropDownStyle = 'DropDownList'
+`$combo.Location = New-Object System.Drawing.Point(18, 120)
+`$combo.Size = New-Object System.Drawing.Size(220, 28)
+
+foreach (`$m in `$PostponeOptionsMinutes) {
+  if (`$m -eq 30)      { [void]`$combo.Items.Add('Postpone 30 minutes') }
+  elseif (`$m -eq 60)  { [void]`$combo.Items.Add('Postpone 1 hour') }
+  elseif (`$m -eq 120) { [void]`$combo.Items.Add('Postpone 2 hours') }
+  else                { [void]`$combo.Items.Add(("Postpone {0} minutes" -f `$m)) }
+}
+`$combo.SelectedIndex = 0
+`$form.Controls.Add(`$combo)
+
+function Get-SelectedPostponeMinutes {
+  `$idx = `$combo.SelectedIndex
+  if (`$idx -lt 0) { return `$PostponeOptionsMinutes[0] }
+  return `$PostponeOptionsMinutes[`$idx]
+}
+
 function Set-Postpone([int]`$Minutes) {
   `$deadline = (Get-Date).AddMinutes([double]`$Minutes)
-  Schedule-Reboot -Seconds ([int](`$Minutes*60)) -Msg ("`$Reason Computer will reboot in `$Minutes minute(s).")
+  Schedule-Reboot -Seconds ([int](`$Minutes*60)) -Msg ("`$Reason This computer will reboot in `$Minutes minute(s).")
   Update-Countdown
 }
 
+`$btnPostpone = New-Object System.Windows.Forms.Button
+`$btnPostpone.Text = 'Postpone'
+`$btnPostpone.Size = New-Object System.Drawing.Size(120, 34)
+`$btnPostpone.Location = New-Object System.Drawing.Point(255, 118)
+`$btnPostpone.Add_Click({
+  `$m = Get-SelectedPostponeMinutes
+  Set-Postpone -Minutes `$m
+})
+`$form.Controls.Add(`$btnPostpone)
+
 `$btnNow = New-Object System.Windows.Forms.Button
 `$btnNow.Text = 'Reboot now'
-`$btnNow.Size = New-Object System.Drawing.Size(115, 34)
-`$btnNow.Location = New-Object System.Drawing.Point(18, 135)
+`$btnNow.Size = New-Object System.Drawing.Size(120, 34)
+`$btnNow.Location = New-Object System.Drawing.Point(390, 118)
 `$btnNow.Add_Click({
   `$deadline = Get-Date
   Schedule-Reboot -Seconds 0 -Msg ("`$Reason Rebooting now.")
   `$form.Close()
 })
 `$form.Controls.Add(`$btnNow)
-
-`$x = 155
-foreach (`$m in `$PostponeOptionsMinutes) {
-  `$b = New-Object System.Windows.Forms.Button
-  if (`$m -eq 30) { `$b.Text = 'Postpone 30m' }
-  elseif (`$m -eq 60) { `$b.Text = 'Postpone 1h' }
-  elseif (`$m -eq 120) { `$b.Text = 'Postpone 2h' }
-  else { `$b.Text = ("Postpone {0}m" -f `$m) }
-
-  `$b.Size = New-Object System.Drawing.Size(125, 34)
-  `$b.Location = New-Object System.Drawing.Point(`$x, 135)
-  `$b.Add_Click({ Set-Postpone -Minutes `$m })
-  `$form.Controls.Add(`$b)
-  `$x += 135
-}
 
 [void]`$form.ShowDialog()
 "@
@@ -226,14 +248,15 @@ function Start-RebootPrompt {
   param(
     [int]$CountdownMinutes,
     [int[]]$PostponeOptionsMinutes,
+    [string]$UiTitle,
     [string]$Reason
   )
 
-  $helper = New-RebootPromptHelperScript -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -Reason $Reason
+  $helper = New-RebootPromptHelperScript -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -UiTitle $UiTitle -Reason $Reason
 
   $runningAsSystem = ($env:USERNAME -eq 'SYSTEM')
 
-  # If already interactive user context, just show it directly
+  # If already running in an interactive user context, show directly.
   if ([Environment]::UserInteractive -and -not $runningAsSystem) {
     Write-Log "Interactive user context detected: launching reboot prompt UI directly."
     Start-Process -FilePath "powershell.exe" -ArgumentList @(
@@ -243,74 +266,57 @@ function Start-RebootPrompt {
     return
   }
 
-  # Under SYSTEM: try to launch in active user session (InteractiveToken task)
-  if (Get-ActiveSessionPresent) {
-    $activeUser = Get-ActiveConsoleUser
-    if (-not $activeUser) {
-      Write-Log "Active session detected but could not resolve username. Falling back to msg.exe + shutdown timer."
-      Send-UserMessage ("{0} This computer will reboot in {1} minutes." -f $Reason, $CountdownMinutes)
-      & shutdown.exe /r /t ($CountdownMinutes*60) /c "$Reason This computer will reboot in $CountdownMinutes minutes." | Out-Null
-      return
+  # SYSTEM context: launch in active user's session via InteractiveToken scheduled task
+  $sess = Get-ActiveSessionInfo
+  if ($sess -and $sess.User) {
+    try { Import-Module ScheduledTasks -ErrorAction Stop } catch { }
+
+    if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) {
+      $taskName = "RebootPromptUI"
+      $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$helper`" -CountdownMinutes $CountdownMinutes"
+
+      $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $args
+      $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(15)
+      $principal = New-ScheduledTaskPrincipal -UserId $sess.User -LogonType InteractiveToken -RunLevel Highest
+      $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
+
+      Write-Log ("Launching reboot prompt UI in user session as {0} (InteractiveToken)." -f $sess.User)
+
+      try {
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName | Out-Null
+        return
+      } catch {
+        Write-Log "InteractiveToken task launch failed; falling back to msg.exe + shutdown timer."
+        Write-Log $_.Exception.Message
+      }
     }
-
-    try {
-      Import-Module ScheduledTasks -ErrorAction Stop
-    } catch {
-      Write-Log "ScheduledTasks module not available. Falling back to msg.exe + shutdown timer."
-      Send-UserMessage ("{0} This computer will reboot in {1} minutes." -f $Reason, $CountdownMinutes)
-      & shutdown.exe /r /t ($CountdownMinutes*60) /c "$Reason This computer will reboot in $CountdownMinutes minutes." | Out-Null
-      return
-    }
-
-    $taskName = "RebootPromptUI"
-    $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$helper`" -CountdownMinutes $CountdownMinutes"
-
-    $action   = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $args
-    $trigger  = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(20)
-    $principal = New-ScheduledTaskPrincipal -UserId $activeUser -LogonType InteractiveToken -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew
-
-    Write-Log ("Launching reboot prompt UI in user session via Scheduled Task (InteractiveToken) as {0}." -f $activeUser)
-
-    try {
-      # overwrite same task name each time (avoids orphaned tasks and schtasks XML issues)
-      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-      Start-ScheduledTask -TaskName $taskName | Out-Null
-    } catch {
-      Write-Log "Scheduled task launch failed. Falling back to msg.exe + shutdown timer."
-      Write-Log $_.Exception.Message
-      Send-UserMessage ("{0} This computer will reboot in {1} minutes." -f $Reason, $CountdownMinutes)
-      & shutdown.exe /r /t ($CountdownMinutes*60) /c "$Reason This computer will reboot in $CountdownMinutes minutes." | Out-Null
-    }
-
-    return
   }
 
-  # No active session: message + scheduled reboot
-  Write-Log "No active user session detected. Scheduling reboot and notifying via msg.exe."
-  Send-UserMessage ("{0} This computer will reboot in {1} minutes." -f $Reason, $CountdownMinutes)
-  & shutdown.exe /r /t ($CountdownMinutes*60) /c "$Reason This computer will reboot in $CountdownMinutes minutes." | Out-Null
+  # Fallback: msg.exe (simple) + scheduled reboot timer
+  Write-Log "Falling back to msg.exe notification + shutdown timer (no interactive UI available)."
+  Send-UserMessage ($Reason + " This computer will reboot in " + $CountdownMinutes + " minutes.")
+  & shutdown.exe /r /t ($CountdownMinutes*60) /c ($Reason + " This computer will reboot in " + $CountdownMinutes + " minutes.") | Out-Null
 }
 
 function Get-AvailableUpdates {
-  $session = New-Object -ComObject Microsoft.Update.Session
+  $session  = New-Object -ComObject Microsoft.Update.Session
   $searcher = $session.CreateUpdateSearcher()
   $criteria = "IsInstalled=0 and IsHidden=0"
-  $result = $searcher.Search($criteria)
+  $result   = $searcher.Search($criteria)
 
   $list = @()
   for ($i=0; $i -lt $result.Updates.Count; $i++) {
     $u = $result.Updates.Item($i)
     try { if ($u.EulaAccepted -eq $false) { $u.AcceptEula() } } catch { }
 
-    # 0=NeverReboots, 1=AlwaysRequiresReboot, 2=CanRequestReboot
     $rb = 2
     try { $rb = [int]$u.InstallationBehavior.RebootBehavior } catch { $rb = 2 }
 
     $list += [pscustomobject]@{
       Update = $u
       Title  = [string]$u.Title
-      RebootBehavior = $rb
+      RebootBehavior = $rb   # 0 NeverReboots, 1 AlwaysRequiresReboot, 2 CanRequestReboot
     }
   }
 
@@ -362,7 +368,7 @@ try {
     Write-Log "No available updates found."
     if ($beforePendingReboot) {
       if ($ReportOnly) { Write-Log "ReportOnly: Would prompt user to reboot."; exit 1 }
-      Start-RebootPrompt -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -Reason $Reason
+      Start-RebootPrompt -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -UiTitle $UiTitle -Reason $Reason
       exit 1
     }
     exit 0
@@ -370,8 +376,8 @@ try {
 
   Write-Log ("Found {0} available update(s)." -f $updates.Count)
 
-  $never    = @($updates | Where-Object { $_.RebootBehavior -eq 0 })
-  $mayReboot = @($updates | Where-Object { $_.RebootBehavior -ne 0 })
+  $never     = @($updates | Where-Object { $_.RebootBehavior -eq 0 })
+  $mayReboot  = @($updates | Where-Object { $_.RebootBehavior -ne 0 })
 
   Write-Log ("Updates that should not require reboot: {0}" -f $never.Count)
   Write-Log ("Updates that may/require reboot: {0}" -f $mayReboot.Count)
@@ -408,7 +414,7 @@ try {
 
   if ($needsReboot) {
     Write-Log "Reboot is required (or reboot-requiring updates are pending). Prompting user with countdown/options."
-    Start-RebootPrompt -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -Reason $Reason
+    Start-RebootPrompt -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -UiTitle $UiTitle -Reason $Reason
     exit 1
   }
 
