@@ -9,3 +9,23 @@ DotNet_IncludeX86	        Boolean	    False	            Also manage x86 under Pr
 DotNet_LatestLTSOnly	    Boolean	    False	            Use latest active LTS channel only
 DotNet_ForceUninstallTool	Boolean	    False	            Pass --force to uninstall tool (riskier)
 DotNet_LogPath	            String	    C:\ProgramData\NexusOpenSystems\DotNet\DotNetRuntimeUpdate.log	Log location
+
+
+
+DotNet_MinKeepVersion (String) → e.g. 8.0.10 or 8.0.0
+
+DotNet_ReportOnly (Boolean) → true/false
+
+DotNet_IncludeX86 (Boolean) → true/false
+
+DotNet_LatestLTSOnly (Boolean) → true/false
+
+DotNet_TargetChannel (String, optional) → e.g. 8.0 (pin channel). Blank = highest active channel.
+
+DotNet_RemoveHostComponents (Boolean) → true/false (Host + HostFX Resolver)
+
+DotNet_RemoveHostingBundle (Boolean) → true/false
+
+DotNet_ForceUninstallTool (Boolean) → true/false (riskier)
+
+DotNet_LogPath (String) → log file path
