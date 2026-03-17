@@ -1,0 +1,11 @@
+If deploying via Datto RMM add variables to component
+
+Datto component variables
+Create these Input Variables in the component (names exactly as below):
+
+Datto Variable Name	        Type	    Default	            What it does
+DotNet_ReportOnly	        Boolean	    False	            Status only
+DotNet_IncludeX86	        Boolean	    False	            Also manage x86 under Program Files (x86)
+DotNet_LatestLTSOnly	    Boolean	    False	            Use latest active LTS channel only
+DotNet_ForceUninstallTool	Boolean	    False	            Pass --force to uninstall tool (riskier)
+DotNet_LogPath	            String	    C:\ProgramData\NexusOpenSystems\DotNet\DotNetRuntimeUpdate.log	Log location

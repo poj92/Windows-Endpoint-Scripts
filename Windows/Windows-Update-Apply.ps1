@@ -14,6 +14,7 @@ Exit codes:
   2 = updates found but none installed (e.g., only reboot-requiring updates and IncludeRebootUpdates not set)
   3 = error
 #>
+
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [int]$CountdownMinutes = 10,
@@ -23,28 +24,27 @@ param(
   [switch]$ReportOnly,
 
   [string]$UiTitle = "A security message from Nexus Open Systems Ltd",
-  [string]$Reason  = "Windows updates require a restart to finish installing."
+  [string]$Reason  = "Windows updates require a restart to finish installing.",
+
+  [string]$LogPath = "$env:ProgramData\NexusOpenSystems\WindowsUpdate\WindowsUpdateReboot.log"
 )
 
 Set-StrictMode -Off
 $ErrorActionPreference = 'Stop'
 
-# ---- logging ----
-$LogDir  = Join-Path $env:ProgramData "NexusOpenSystems\WindowsUpdate"
-$LogFile = Join-Path $LogDir "WindowsUpdateReboot.log"
-New-Item -ItemType Directory -Path $LogDir -Force | Out-Null
+New-Item -ItemType Directory -Path (Split-Path -Parent $LogPath) -Force | Out-Null
 
 function Write-Log([string]$Message) {
   $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
   $line = "[{0}] {1}" -f $ts, $Message
   Write-Host $line
-  try { Add-Content -Path $LogFile -Value $line -Encoding UTF8 } catch { }
+  try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 } catch { }
 }
 
 function Test-IsAdmin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   $p  = New-Object Security.Principal.WindowsPrincipal($id)
-  return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
 function Test-PendingReboot {
@@ -96,6 +96,37 @@ function Get-ActiveUser {
   return Get-ActiveUserFromExplorer
 }
 
+function Ensure-ScheduledTasksModule {
+  try { Import-Module ScheduledTasks -ErrorAction Stop; return $true } catch { return $false }
+}
+
+function Set-RebootDeadlineTask {
+  param(
+    [Parameter(Mandatory)][datetime]$When,
+    [Parameter(Mandatory)][string]$Reason
+  )
+
+  # Cancel any previous shutdown timer (prevents Windows /t notifications from earlier runs)
+  try { & shutdown.exe /a | Out-Null } catch { }
+
+  if (-not (Ensure-ScheduledTasksModule)) { return $false }
+  if (-not (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue)) { return $false }
+
+  $taskName  = "Nexus_Reboot_Deadline"
+  $action    = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument ('/r /t 0 /c "' + $Reason + '"')
+  $trigger   = New-ScheduledTaskTrigger -Once -At $When
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+  $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+
+  try {
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+    return $true
+  } catch {
+    Write-Log ("WARNING: Failed to schedule reboot deadline task: {0}" -f $_.Exception.Message)
+    return $false
+  }
+}
+
 function New-RebootPromptHelperScript {
   param(
     [int]$CountdownMinutes,
@@ -104,13 +135,10 @@ function New-RebootPromptHelperScript {
     [string]$Reason
   )
 
-  $dir = Join-Path $env:ProgramData 'NexusOpenSystems\WindowsUpdate'
-  New-Item -ItemType Directory -Path $dir -Force | Out-Null
-
+  $dir = Split-Path -Parent $LogPath
   $helper = Join-Path $dir 'RebootPromptUI.ps1'
   $optsCsv = ($PostponeOptionsMinutes | ForEach-Object { [int]$_ }) -join ','
 
-  # Helper uses a scheduled "deadline reboot" task (shutdown /t 0 at trigger time) to avoid Windows /t warnings.
   $content = @"
 param(
   [int]`$CountdownMinutes = $CountdownMinutes,
@@ -123,42 +151,34 @@ $Reason
 '@
 )
 
+`$ErrorActionPreference = 'Stop'
+
+# Force a deadline reboot task (avoids Windows /t "about to be logged off" toast)
+Import-Module ScheduledTasks -ErrorAction SilentlyContinue
+`$TaskName = 'Nexus_Reboot_Deadline_UI'
+
+function Set-RebootDeadline([datetime]`$When) {
+  try { & shutdown.exe /a | Out-Null } catch { }
+
+  try {
+    `$action  = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument ('/r /t 0 /c "' + `$Reason + '"')
+    `$trigger = New-ScheduledTaskTrigger -Once -At `$When
+    `$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    `$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Register-ScheduledTask -TaskName `$TaskName -Action `$action -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
+    return `$true
+  } catch { return `$false }
+}
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-`$TaskName = 'Nexus_Reboot_Deadline'
-
-function Ensure-TaskModule {
-  try { Import-Module ScheduledTasks -ErrorAction Stop; return `$true } catch { return `$false }
-}
-
-function Set-RebootDeadline([datetime]`$When) {
-  # Cancel any existing shutdown timer
-  try { & shutdown.exe /a | Out-Null } catch { }
-
-  if (-not (Ensure-TaskModule)) { return `$false }
-
-  `$action  = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument ('/r /t 0 /c ""' + `$Reason + '""')
-  `$trigger = New-ScheduledTaskTrigger -Once -At `$When
-  `$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-  `$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-  try {
-    Register-ScheduledTask -TaskName `$TaskName -Action `$action -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
-    return `$true
-  } catch {
-    return `$false
-  }
-}
-
-# Parse postpone options
 `$PostponeOptionsMinutes = @()
 if (`$PostponeCsv) {
   foreach (`$x in (`$PostponeCsv -split ',')) { try { `$PostponeOptionsMinutes += [int]`$x } catch { } }
 }
 if (-not `$PostponeOptionsMinutes -or `$PostponeOptionsMinutes.Count -eq 0) { `$PostponeOptionsMinutes = @(30,60,120) }
 
-# Set initial deadline
 `$deadline = (Get-Date).AddMinutes([double]`$CountdownMinutes)
 [void](Set-RebootDeadline -When `$deadline)
 
@@ -265,54 +285,44 @@ function Start-RebootPrompt {
   $helper = New-RebootPromptHelperScript -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -UiTitle $UiTitle -Reason $Reason
   $runningAsSystem = ($env:USERNAME -eq 'SYSTEM')
 
-  # OPTION A (as requested): always launch helper hidden in interactive user context (no extra console)
+  # If user-run interactive: launch hidden + STA so UI is stable and no console flashes
   if ([Environment]::UserInteractive -and -not $runningAsSystem) {
-    Write-Log "Interactive user context: launching UI hidden."
+    Write-Log "Interactive user context: launching UI hidden (STA)."
     Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList @(
-      "-NoProfile","-ExecutionPolicy","Bypass","-File", "`"$helper`"",
+      "-NoProfile","-ExecutionPolicy","Bypass","-STA",
+      "-File", "`"$helper`"",
       "-CountdownMinutes", "$CountdownMinutes"
     ) | Out-Null
     return
   }
 
-  # SYSTEM context: try to run UI in active user session using InteractiveToken task
+  # SYSTEM context: schedule UI to run as active user (LogonType Interactive) and run it STA + hidden
   $active = Get-ActiveUser
-  if ($active -and $active.User) {
-    try { Import-Module ScheduledTasks -ErrorAction Stop } catch { }
+  if ($active -and $active.User -and (Ensure-ScheduledTasksModule)) {
+    $taskName = "Nexus_RebootPromptUI"
+    $args = "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$helper`" -CountdownMinutes $CountdownMinutes"
+    $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $args
+    $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10)
+    $principal = New-ScheduledTaskPrincipal -UserId $active.User -LogonType Interactive -RunLevel Highest
+    $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
-    if (Get-Command Register-ScheduledTask -ErrorAction SilentlyContinue) {
-      $taskName = "Nexus_RebootPromptUI"
-      $args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -File `"$helper`" -CountdownMinutes $CountdownMinutes"
-      $action    = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $args
-      $trigger   = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(15)
-      $principal = New-ScheduledTaskPrincipal -UserId $active.User -LogonType InteractiveToken -RunLevel Highest
-      $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+    Write-Log ("SYSTEM context: launching UI in session as {0} (LogonType=Interactive, STA, Hidden)." -f $active.User)
 
-      Write-Log ("SYSTEM context: launching UI in session as {0} (InteractiveToken)." -f $active.User)
-
-      try {
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName | Out-Null
-        return
-      } catch {
-        Write-Log "InteractiveToken UI task failed."
-        Write-Log $_.Exception.Message
-      }
+    try {
+      Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
+      Start-ScheduledTask -TaskName $taskName | Out-Null
+      return
+    } catch {
+      Write-Log "WARNING: Failed to launch UI via ScheduledTasks."
+      Write-Log $_.Exception.Message
     }
   }
 
-  # Fallback: no UI possible -> schedule reboot deadline task and notify
-  Write-Log "No interactive UI available; scheduling deadline reboot task + msg.exe notification."
+  # Fallback: schedule reboot + msg
+  Write-Log "No interactive UI available; scheduling reboot deadline and notifying with msg.exe."
   Send-UserMessage ($Reason + " This computer will reboot in " + $CountdownMinutes + " minutes.")
-  try {
-    Import-Module ScheduledTasks -ErrorAction Stop
-    $deadline = (Get-Date).AddMinutes([double]$CountdownMinutes)
-    $action  = New-ScheduledTaskAction -Execute 'shutdown.exe' -Argument ('/r /t 0 /c "' + $Reason + '"')
-    $trigger = New-ScheduledTaskTrigger -Once -At $deadline
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew
-    Register-ScheduledTask -TaskName 'Nexus_Reboot_Deadline' -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-  } catch {
+  $ok = Set-RebootDeadlineTask -When ((Get-Date).AddMinutes([double]$CountdownMinutes)) -Reason $Reason
+  if (-not $ok) {
     & shutdown.exe /r /t ($CountdownMinutes*60) /c ($Reason + " This computer will reboot in " + $CountdownMinutes + " minutes.") | Out-Null
   }
 }
@@ -334,14 +344,11 @@ function Get-AvailableUpdates {
     $list += [pscustomobject]@{ Update=$u; Title=[string]$u.Title; RebootBehavior=$rb }
   }
 
-  return [pscustomobject]@{ Session=$session; Updates=$list }
+  [pscustomobject]@{ Session=$session; Updates=$list }
 }
 
 function Install-Updates {
-  param(
-    [Parameter(Mandatory)]$Session,
-    [Parameter(Mandatory)][object[]]$UpdatesToInstall
-  )
+  param([Parameter(Mandatory)]$Session, [Parameter(Mandatory)][object[]]$UpdatesToInstall)
 
   if (-not $UpdatesToInstall -or $UpdatesToInstall.Count -eq 0) {
     return [pscustomobject]@{ InstalledCount=0; RebootRequired=$false; ResultCode=0 }
@@ -360,7 +367,7 @@ function Install-Updates {
   Write-Log ("Installing {0} update(s)..." -f $coll.Count)
   $res = $installer.Install()
 
-  return [pscustomobject]@{
+  [pscustomobject]@{
     InstalledCount = [int]$coll.Count
     RebootRequired = [bool]$res.RebootRequired
     ResultCode     = [int]$res.ResultCode
@@ -390,8 +397,8 @@ try {
 
   Write-Log ("Found {0} available update(s)." -f $updates.Count)
 
-  $never    = @($updates | Where-Object { $_.RebootBehavior -eq 0 })
-  $mayReboot = @($updates | Where-Object { $_.RebootBehavior -ne 0 })
+  $never     = @($updates | Where-Object { $_.RebootBehavior -eq 0 })
+  $mayReboot  = @($updates | Where-Object { $_.RebootBehavior -ne 0 })
 
   Write-Log ("Updates that should not require reboot: {0}" -f $never.Count)
   Write-Log ("Updates that may/require reboot: {0}" -f $mayReboot.Count)
@@ -406,21 +413,17 @@ try {
   $rebootFromInstall = $false
 
   if ($never.Count -gt 0) {
-    if ($PSCmdlet.ShouldProcess("Windows Update", "Install non-reboot updates")) {
-      $r1 = Install-Updates -Session $scan.Session -UpdatesToInstall $never
-      $didInstall = ($r1.InstalledCount -gt 0)
-      $rebootFromInstall = $rebootFromInstall -or $r1.RebootRequired
-      Write-Log ("Installed {0} non-reboot update(s). RebootRequired={1}" -f $r1.InstalledCount, $r1.RebootRequired)
-    }
+    $r1 = Install-Updates -Session $scan.Session -UpdatesToInstall $never
+    $didInstall = ($r1.InstalledCount -gt 0)
+    $rebootFromInstall = $rebootFromInstall -or $r1.RebootRequired
+    Write-Log ("Installed {0} non-reboot update(s). RebootRequired={1}" -f $r1.InstalledCount, $r1.RebootRequired)
   }
 
   if ($IncludeRebootUpdates -and $mayReboot.Count -gt 0) {
-    if ($PSCmdlet.ShouldProcess("Windows Update", "Install reboot-requiring updates")) {
-      $r2 = Install-Updates -Session $scan.Session -UpdatesToInstall $mayReboot
-      $didInstall = $didInstall -or ($r2.InstalledCount -gt 0)
-      $rebootFromInstall = $rebootFromInstall -or $r2.RebootRequired
-      Write-Log ("Installed {0} reboot update(s). RebootRequired={1}" -f $r2.InstalledCount, $r2.RebootRequired)
-    }
+    $r2 = Install-Updates -Session $scan.Session -UpdatesToInstall $mayReboot
+    $didInstall = $didInstall -or ($r2.InstalledCount -gt 0)
+    $rebootFromInstall = $rebootFromInstall -or $r2.RebootRequired
+    Write-Log ("Installed {0} reboot update(s). RebootRequired={1}" -f $r2.InstalledCount, $r2.RebootRequired)
   }
 
   $afterPendingReboot = Test-PendingReboot
@@ -442,5 +445,5 @@ try {
 }
 catch {
   Write-Log ("ERROR: {0}" -f $_.Exception.Message)
-  throw
+  exit 3
 }
