@@ -14,7 +14,7 @@ Exit codes:
   2 = updates found but none installed (e.g., only reboot-requiring updates and IncludeRebootUpdates not set)
   3 = error
 #>
-#Requires -Version 5.1
+
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [int]$CountdownMinutes = 10,
@@ -38,6 +38,16 @@ function Write-Log([string]$Message) {
   $line = "[{0}] {1}" -f $ts, $Message
   Write-Host $line
   try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 } catch { }
+}
+
+function Clear-NexusRebootTasks {
+  # PowerShell-safe cleanup of tasks from previous script versions
+  $tasks = @('Nexus_RebootPromptUI','Nexus_Reboot_Deadline','Nexus_Reboot_Deadline_UI','Nexus_Reboot_Deadline_UI','Nexus_Reboot_Deadline_UI')
+  foreach ($t in ($tasks | Sort-Object -Unique)) {
+    try { schtasks.exe /Delete /TN $t /F *> $null } catch { }
+  }
+  # Also try to abort any existing shutdown timer silently (no output)
+  try { & cmd.exe /c "shutdown.exe /a >nul 2>&1" | Out-Null } catch { }
 }
 
 function Test-IsAdmin {
@@ -64,11 +74,7 @@ function Test-PendingReboot {
 function Get-ActiveSessionPresent {
   try {
     $out = & quser 2>$null
-    if ($out) {
-      foreach ($l in $out) {
-        if ($l -match '\sActive\s') { return $true }
-      }
-    }
+    if ($out) { foreach ($l in $out) { if ($l -match '\sActive\s') { return $true } } }
   } catch { }
   return $false
 }
@@ -108,16 +114,13 @@ $Reason
 Set-StrictMode -Off
 `$ErrorActionPreference = 'Stop'
 
-# Make WinForms reliable
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-# Suppress shutdown /a output completely
 function Abort-ShutdownSilently {
   try { & cmd.exe /c "shutdown.exe /a >nul 2>&1" | Out-Null } catch { }
 }
 
-# Schedule reboot at deadline via ScheduledTasks (no Windows /t toast)
 function Set-RebootDeadline([datetime]`$When) {
   Abort-ShutdownSilently
 
@@ -128,22 +131,17 @@ function Set-RebootDeadline([datetime]`$When) {
     `$trigger   = New-ScheduledTaskTrigger -Once -At `$When
     `$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
     `$settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
     Register-ScheduledTask -TaskName 'Nexus_Reboot_Deadline' -Action `$action -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
     return `$true
-  } catch {
-    return `$false
-  }
+  } catch { return `$false }
 }
 
-# Parse postpone options
 `$PostponeOptionsMinutes = @()
 if (`$PostponeCsv) {
   foreach (`$x in (`$PostponeCsv -split ',')) { try { `$PostponeOptionsMinutes += [int]`$x } catch { } }
 }
 if (-not `$PostponeOptionsMinutes -or `$PostponeOptionsMinutes.Count -eq 0) { `$PostponeOptionsMinutes = @(30,60,120) }
 
-# IMPORTANT: use script scope so postpone updates the live countdown
 `$script:deadline = (Get-Date).AddMinutes([double]`$CountdownMinutes)
 [void](Set-RebootDeadline -When `$script:deadline)
 
@@ -262,7 +260,6 @@ function Start-RebootPrompt {
   $dir = Split-Path -Parent $LogPath
   $helper = New-RebootPromptHelperScript -CountdownMinutes $CountdownMinutes -PostponeOptionsMinutes $PostponeOptionsMinutes -UiTitle $UiTitle -Reason $Reason -Dir $dir
 
-  # If no active session, no interactive UI is possible
   if (-not (Get-ActiveSessionPresent)) {
     Write-Log "No active user session detected; falling back to msg.exe + scheduled reboot deadline."
     Send-UserMessage ($Reason + " This computer will reboot in " + $CountdownMinutes + " minutes.")
@@ -279,7 +276,6 @@ function Start-RebootPrompt {
     return
   }
 
-  # Create a wrapper .cmd so schtasks /TR quoting is stable
   $wrapper = Join-Path (Split-Path -Parent $helper) 'RunRebootPrompt.cmd'
   $ps = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
   $cmd = "@echo off`r`n`"$ps`" -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$helper`" -CountdownMinutes $CountdownMinutes`r`n"
@@ -287,15 +283,13 @@ function Start-RebootPrompt {
 
   $taskName = "Nexus_RebootPromptUI"
 
-  # Locale-safe date for schtasks
   $dt = Get-Date
   $sd = $dt.ToString((Get-Culture).DateTimeFormat.ShortDatePattern) -replace '[\.\-]', '/'
   $st = $dt.AddMinutes(1).ToString('HH:mm')
 
   Write-Log "Launching UI as SYSTEM (interactive) via schtasks /IT..."
 
-  # Clean old task name if present
-  try { & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null } catch { }
+  try { schtasks.exe /Delete /TN $taskName /F *> $null } catch { }
 
   $createOut = & schtasks.exe /Create /TN $taskName /TR "`"$wrapper`"" /SC ONCE /ST $st /SD $sd /RU SYSTEM /RL HIGHEST /IT /F 2>&1
   if ($LASTEXITCODE -ne 0) {
@@ -313,8 +307,7 @@ function Start-RebootPrompt {
     return
   }
 
-  # Optional: delete the launcher task after starting (helper remains running)
-  try { & schtasks.exe /Delete /TN $taskName /F 2>$null | Out-Null } catch { }
+  try { schtasks.exe /Delete /TN $taskName /F *> $null } catch { }
 }
 
 function Get-AvailableUpdates {
@@ -366,6 +359,9 @@ try {
   Write-Host "Windows-Update-Force-Apply"
 
   if (-not (Test-IsAdmin)) { throw "Run this script elevated (Administrator / SYSTEM)." }
+
+  # Added: safe cleanup of old tasks and any prior shutdown timer
+  Clear-NexusRebootTasks
 
   Write-Log "Scanning for Windows updates..."
   $beforePendingReboot = Test-PendingReboot
