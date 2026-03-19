@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-VC++ Any-Version Conditional Install + MinKeep Cleanup (Improved detection/logging)
+VC++ Any-Version Conditional Install + MinKeep Cleanup (fix: op_Addition + correct counts)
 
 Rules:
 1) Detect installed "Microsoft Visual C++" entries (x86/x64) from ARP.
@@ -86,13 +86,6 @@ function Test-IsAdmin {
   return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# Turn any result into a REAL array with no null elements
-function Normalize-List($obj) {
-  if ($null -eq $obj) { return @() }
-  $arr = @($obj) | Where-Object { $_ -ne $null }
-  return $arr
-}
-
 function Parse-VersionFlexible([string]$v) {
   if (-not $v) { return $null }
   $m = [regex]::Match($v.Trim(), '^(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?')
@@ -139,13 +132,13 @@ function Get-VcEntries([ValidateSet('x86','x64')]$Arch) {
 
     $all += [pscustomobject]@{ Arch=$Arch; Version=$vv; Entry=$e }
   }
-  return Normalize-List ($all | Where-Object { $_.Entry -ne $null })
+  return @($all | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 }
 
 function Get-MaxVersion($list) {
-  $list = Normalize-List $list
-  if ($list.Count -eq 0) { return $null }
-  return ($list | Sort-Object Version -Descending | Select-Object -First 1).Version
+  $arr = @($list) | Where-Object { $_ -ne $null -and $_.Version -ne $null }
+  if ($arr.Count -eq 0) { return $null }
+  return ($arr | Sort-Object Version -Descending | Select-Object -First 1).Version
 }
 
 function Normalize-MsiUninstall([string]$cmd) {
@@ -154,11 +147,8 @@ function Normalize-MsiUninstall([string]$cmd) {
   if ($cmd -match '(?i)msiexec(\.exe)?\s') {
     $args = $cmd -replace '(?i)^.*?msiexec(\.exe)?\s*', ''
     $args = $args -replace '(?i)/I', '/X'
-    if ($ForceMSI) {
-      if ($args -notmatch '(?i)/qn') { $args += ' /qn' }
-    } else {
-      if ($args -notmatch '(?i)/quiet') { $args += ' /quiet' }
-    }
+    if ($ForceMSI) { if ($args -notmatch '(?i)/qn') { $args += ' /qn' } }
+    else { if ($args -notmatch '(?i)/quiet') { $args += ' /quiet' } }
     if ($args -notmatch '(?i)/norestart') { $args += ' /norestart' }
     return @{ Exe='msiexec.exe'; Args=$args }
   }
@@ -210,31 +200,36 @@ try {
   $minKeep = Parse-VersionFlexible $MinKeepVersion
   if (-not $minKeep) { throw "Invalid MinKeepVersion '$MinKeepVersion'." }
 
-  # Inventory (always arrays)
-  $instX64 = if ($IncludeX64) { Normalize-List (Get-VcEntries -Arch x64) } else { @() }
-  $instX86 = if ($IncludeX86) { Normalize-List (Get-VcEntries -Arch x86) } else { @() }
+  # Inventory - always treat as arrays for logging/logic
+  $instX64 = if ($IncludeX64) { @((Get-VcEntries -Arch x64) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
+  $instX86 = if ($IncludeX86) { @((Get-VcEntries -Arch x86) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
 
   $maxX64 = Get-MaxVersion $instX64
   $maxX86 = Get-MaxVersion $instX86
 
-  Write-Log ("VC++ entries detected: x64={0} x86={1}" -f $instX64.Count, $instX86.Count)
+  Write-Log ("VC++ entries detected: x64={0} x86={1}" -f (@($instX64).Count), (@($instX86).Count))
   Write-Log ("Highest detected versions: x64={0} x86={1}" -f ($(if ($maxX64) { $maxX64 } else { "<none>" })), ($(if ($maxX86) { $maxX86 } else { "<none>" })))
   Write-Log ("MinKeepVersion (remove below): {0}" -f $minKeep)
 
-  $belowMinX64 = if ($IncludeX64) { Normalize-List ($instX64 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
-  $belowMinX86 = if ($IncludeX86) { Normalize-List ($instX86 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
+  $belowMinX64 = if ($IncludeX64) { @($instX64 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
+  $belowMinX86 = if ($IncludeX86) { @($instX86 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
 
-  $belowMinAll = Normalize-List (@($belowMinX64 + $belowMinX86) | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
+  # FIX: do NOT use '+' on objects; use += to build a real array
+  $belowMinAll = @()
+  $belowMinAll += @($belowMinX64)
+  $belowMinAll += @($belowMinX86)
+  $belowMinAll = @($belowMinAll | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 
-  Write-Log ("Entries below MinKeepVersion: x64={0} x86={1} total={2}" -f $belowMinX64.Count, $belowMinX86.Count, $belowMinAll.Count)
+  Write-Log ("Entries below MinKeepVersion: x64={0} x86={1} total={2}" -f (@($belowMinX64).Count), (@($belowMinX86).Count), (@($belowMinAll).Count))
 
-  if ($belowMinAll.Count -eq 0) {
+  if (@($belowMinAll).Count -eq 0) {
     Write-Log "No installed VC++ entries below MinKeepVersion. No install/uninstall will be performed."
     exit 0
   }
 
-  if ($IncludeX64 -and $belowMinX64.Count -gt 0 -and -not $TargetUrlX64) { throw "Missing VCRedist_TargetUrl_X64 (needed because x64 has below-min entries)." }
-  if ($IncludeX86 -and $belowMinX86.Count -gt 0 -and -not $TargetUrlX86) { throw "Missing VCRedist_TargetUrl_X86 (needed because x86 has below-min entries)." }
+  # URLs only required if that arch has below-min entries
+  if ($IncludeX64 -and (@($belowMinX64).Count -gt 0) -and -not $TargetUrlX64) { throw "Missing VCRedist_TargetUrl_X64 (needed because x64 has below-min entries)." }
+  if ($IncludeX86 -and (@($belowMinX86).Count -gt 0) -and -not $TargetUrlX86) { throw "Missing VCRedist_TargetUrl_X86 (needed because x86 has below-min entries)." }
 
   if ($ReportOnly) {
     Write-Log "ReportOnly: would install from provided URL(s) for affected arch(es) and remove below-min entries."
@@ -245,7 +240,7 @@ try {
   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
   try {
-    if ($IncludeX64 -and $belowMinX64.Count -gt 0) {
+    if ($IncludeX64 -and (@($belowMinX64).Count -gt 0)) {
       $fileX64 = Join-Path $tmp "vc_redist.x64.exe"
       Write-Log "Downloading target x64 installer..."
       Download-File -Url $TargetUrlX64 -OutFile $fileX64
@@ -254,7 +249,7 @@ try {
       Write-Log "x64: no below-min entries; skipping install."
     }
 
-    if ($IncludeX86 -and $belowMinX86.Count -gt 0) {
+    if ($IncludeX86 -and (@($belowMinX86).Count -gt 0)) {
       $fileX86 = Join-Path $tmp "vc_redist.x86.exe"
       Write-Log "Downloading target x86 installer..."
       Download-File -Url $TargetUrlX86 -OutFile $fileX86
@@ -266,17 +261,17 @@ try {
     Write-Log "Removing installed VC++ entries below MinKeepVersion..."
     foreach ($x in ($belowMinAll | Sort-Object Version)) { Uninstall-Entry $x }
 
-    # Rescan & remove any remaining below-min entries
-    $instX64b = if ($IncludeX64) { Normalize-List (Get-VcEntries -Arch x64) } else { @() }
-    $instX86b = if ($IncludeX86) { Normalize-List (Get-VcEntries -Arch x86) } else { @() }
+    # Rescan and remove any remaining below-min entries
+    $instX64b = if ($IncludeX64) { @((Get-VcEntries -Arch x64) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
+    $instX86b = if ($IncludeX86) { @((Get-VcEntries -Arch x86) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
 
     $below2 = @()
-    if ($IncludeX64) { $below2 += Normalize-List ($instX64b | Where-Object { $_.Version -lt $minKeep }) }
-    if ($IncludeX86) { $below2 += Normalize-List ($instX86b | Where-Object { $_.Version -lt $minKeep }) }
-    $below2 = Normalize-List ($below2 | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
+    if ($IncludeX64) { $below2 += @($instX64b | Where-Object { $_.Version -lt $minKeep }) }
+    if ($IncludeX86) { $below2 += @($instX86b | Where-Object { $_.Version -lt $minKeep }) }
+    $below2 = @($below2 | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 
-    if ($below2.Count -gt 0) {
-      Write-Log ("Removing remaining below-min VC++ entries: {0}" -f $below2.Count)
+    if (@($below2).Count -gt 0) {
+      Write-Log ("Removing remaining below-min VC++ entries: {0}" -f (@($below2).Count))
       foreach ($x in ($below2 | Sort-Object Version)) { Uninstall-Entry $x }
     }
 
