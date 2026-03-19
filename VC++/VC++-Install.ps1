@@ -1,19 +1,15 @@
 #Requires -Version 5.1
 <#
-VC++ Any-Version Conditional Install + MinKeep Cleanup
+VC++ Any-Version Conditional Install + MinKeep Cleanup (FIXED null handling)
 
-Behavior:
-1) Detect installed Microsoft Visual C++ redistributables/runtimes (x86/x64) via ARP (Apps & Features).
-2) If NO installed VC++ entry is below MinKeepVersion => DO NOTHING (no install).
+Rules:
+1) Detect installed Microsoft Visual C++ entries (x86/x64) from ARP.
+2) If no installed VC++ entry is below MinKeepVersion => DO NOTHING (no install).
 3) If any installed VC++ entry is below MinKeepVersion:
-   - Download and install the provided URL installer(s) (x86/x64 as selected; per-arch install only if that arch has below-min items)
+   - Install provided URL installer(s) ONLY for architectures that have below-min items
    - Uninstall all VC++ entries below MinKeepVersion
-   - Rescan and uninstall any remaining below-min entries
+   - Rescan & remove any remaining below-min entries
 4) Clean up downloaded installers.
-
-Notes:
-- "Remove their files": the MSI uninstall removes the installed files correctly.
-- Script does NOT delete Windows Installer cache / Package Cache (unsafe).
 
 Datto env vars:
   VCRedist_TargetUrl_X64
@@ -26,7 +22,7 @@ Datto env vars:
   VCRedist_LogPath
 
 Exit codes:
-  0 = no changes needed (or no below-min found)
+  0 = no changes needed
   1 = changes made
   2 = report only; changes would be made
   3 = error
@@ -61,13 +57,13 @@ function Get-EnvBool([string]$Name, [bool]$Default=$false) {
   }
 }
 
-if (-not $PSBoundParameters.ContainsKey('TargetUrlX64'))  { $TargetUrlX64  = Get-Env 'VCRedist_TargetUrl_X64' }
-if (-not $PSBoundParameters.ContainsKey('TargetUrlX86'))  { $TargetUrlX86  = Get-Env 'VCRedist_TargetUrl_X86' }
-if (-not $PSBoundParameters.ContainsKey('MinKeepVersion')){ $MinKeepVersion= Get-Env 'VCRedist_MinKeepVersion' }
-if (-not $PSBoundParameters.ContainsKey('ReportOnly'))    { $ReportOnly    = Get-EnvBool 'VCRedist_ReportOnly' $false }
-if (-not $PSBoundParameters.ContainsKey('IncludeX64'))    { $IncludeX64    = Get-EnvBool 'VCRedist_IncludeX64' $true }
-if (-not $PSBoundParameters.ContainsKey('IncludeX86'))    { $IncludeX86    = Get-EnvBool 'VCRedist_IncludeX86' $true }
-if (-not $PSBoundParameters.ContainsKey('ForceMSI'))      { $ForceMSI      = Get-EnvBool 'VCRedist_ForceMSI' $false }
+if (-not $PSBoundParameters.ContainsKey('TargetUrlX64'))   { $TargetUrlX64   = Get-Env 'VCRedist_TargetUrl_X64' }
+if (-not $PSBoundParameters.ContainsKey('TargetUrlX86'))   { $TargetUrlX86   = Get-Env 'VCRedist_TargetUrl_X86' }
+if (-not $PSBoundParameters.ContainsKey('MinKeepVersion')) { $MinKeepVersion = Get-Env 'VCRedist_MinKeepVersion' }
+if (-not $PSBoundParameters.ContainsKey('ReportOnly'))     { $ReportOnly     = Get-EnvBool 'VCRedist_ReportOnly' $false }
+if (-not $PSBoundParameters.ContainsKey('IncludeX64'))     { $IncludeX64     = Get-EnvBool 'VCRedist_IncludeX64' $true }
+if (-not $PSBoundParameters.ContainsKey('IncludeX86'))     { $IncludeX86     = Get-EnvBool 'VCRedist_IncludeX86' $true }
+if (-not $PSBoundParameters.ContainsKey('ForceMSI'))       { $ForceMSI       = Get-EnvBool 'VCRedist_ForceMSI' $false }
 if (-not $PSBoundParameters.ContainsKey('LogPath')) {
   $lp = Get-Env 'VCRedist_LogPath'
   if ($lp) { $LogPath = $lp }
@@ -82,10 +78,7 @@ function Write-Log([string]$Message) {
   Write-Host $line
   try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 } catch { }
 }
-
-function Ensure-Tls12 {
-  try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
-}
+function Ensure-Tls12 { try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { } }
 
 function Test-IsAdmin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -94,7 +87,6 @@ function Test-IsAdmin {
 }
 
 function Parse-VersionFlexible([string]$v) {
-  # Accepts "14.38.33135.0", "10.0.40219", "12.0.40664.0" etc. Normalizes to 4-part Version.
   if (-not $v) { return $null }
   $m = [regex]::Match($v.Trim(), '^(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?')
   if (-not $m.Success) { return $null }
@@ -124,7 +116,6 @@ function Get-ArpEntries {
 }
 
 function Get-VcEntries([ValidateSet('x86','x64')]$Arch) {
-  # Broad match: any "Microsoft Visual C++" entry with arch marker.
   $all = @()
   foreach ($e in (Get-ArpEntries)) {
     if ($e.DisplayName -notmatch '^Microsoft Visual C\+\+') { continue }
@@ -132,7 +123,6 @@ function Get-VcEntries([ValidateSet('x86','x64')]$Arch) {
     if ($Arch -eq 'x64' -and $e.DisplayName -notmatch '\(x64\)') { continue }
     if ($Arch -eq 'x86' -and $e.DisplayName -notmatch '\(x86\)') { continue }
 
-    # Prefer DisplayVersion; fallback to parsing from name if needed
     $vv = Parse-VersionFlexible $e.DisplayVersion
     if (-not $vv) {
       $m = [regex]::Match($e.DisplayName, '(\d+\.\d+(?:\.\d+){0,2})')
@@ -142,7 +132,7 @@ function Get-VcEntries([ValidateSet('x86','x64')]$Arch) {
 
     $all += [pscustomobject]@{ Arch=$Arch; Version=$vv; Entry=$e }
   }
-  $all | Sort-Object Version
+  return @($all | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 }
 
 function Normalize-MsiUninstall([string]$cmd) {
@@ -164,6 +154,8 @@ function Normalize-MsiUninstall([string]$cmd) {
 }
 
 function Uninstall-Entry($obj) {
+  if (-not $obj -or -not $obj.Entry) { return }
+
   $e = $obj.Entry
   $cmd = $e.QuietUninstallString
   if (-not $cmd) { $cmd = $e.UninstallString }
@@ -187,8 +179,6 @@ function Install-FromExe([string]$InstallerPath, [string]$Label) {
   $p = Start-Process -FilePath $InstallerPath -ArgumentList "/install /quiet /norestart" -Wait -PassThru -NoNewWindow
   Write-Log ("Install exit code: {0}" -f $p.ExitCode)
 
-  # Common acceptable exit codes:
-  # 0 = success, 3010 = success/reboot required, 1638 = another version installed (often newer), 1641 = restart initiated
   if (@(0,3010,1638,1641) -notcontains $p.ExitCode) {
     throw "$Label installer failed (exit $($p.ExitCode))."
   }
@@ -205,9 +195,9 @@ try {
   if (-not $MinKeepVersion) { throw "VCRedist_MinKeepVersion is required." }
 
   $minKeep = Parse-VersionFlexible $MinKeepVersion
-  if (-not $minKeep) { throw "Invalid MinKeepVersion '$MinKeepVersion' (expected numeric like 10.0.40219.0 or 14.38.33135.0)." }
+  if (-not $minKeep) { throw "Invalid MinKeepVersion '$MinKeepVersion'." }
 
-  # Inventory
+  # Inventory (always arrays)
   $instX64 = if ($IncludeX64) { @(Get-VcEntries -Arch x64) } else { @() }
   $instX86 = if ($IncludeX86) { @(Get-VcEntries -Arch x86) } else { @() }
 
@@ -216,17 +206,21 @@ try {
 
   $belowMinX64 = if ($IncludeX64) { @($instX64 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
   $belowMinX86 = if ($IncludeX86) { @($instX86 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
-  $belowMinAll = @($belowMinX64 + $belowMinX86)
+
+  $belowMinAll = @()
+  $belowMinAll += $belowMinX64
+  $belowMinAll += $belowMinX86
+  $belowMinAll = @($belowMinAll | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 
   Write-Log ("Entries below MinKeepVersion: x64={0} x86={1} total={2}" -f $belowMinX64.Count, $belowMinX86.Count, $belowMinAll.Count)
 
-  # RULE: do nothing unless there is at least one installed VC++ entry below the threshold
+  # Rule: do nothing unless there is at least one real below-min entry
   if ($belowMinAll.Count -eq 0) {
     Write-Log "No installed VC++ entries below MinKeepVersion. No install/uninstall will be performed."
     exit 0
   }
 
-  # Validate URLs only when action is required
+  # Validate URLs only when needed for that arch
   if ($IncludeX64 -and $belowMinX64.Count -gt 0 -and -not $TargetUrlX64) { throw "Missing VCRedist_TargetUrl_X64 (needed because x64 has below-min entries)." }
   if ($IncludeX86 -and $belowMinX86.Count -gt 0 -and -not $TargetUrlX86) { throw "Missing VCRedist_TargetUrl_X86 (needed because x86 has below-min entries)." }
 
@@ -239,7 +233,6 @@ try {
   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
   try {
-    # Install only for architectures that actually have below-min entries
     if ($IncludeX64 -and $belowMinX64.Count -gt 0) {
       $fileX64 = Join-Path $tmp "vc_redist.x64.exe"
       Write-Log "Downloading target x64 installer..."
@@ -258,18 +251,16 @@ try {
       Write-Log "x86: no below-min entries; skipping install."
     }
 
-    # Uninstall below-min entries (oldest first)
     Write-Log "Removing installed VC++ entries below MinKeepVersion..."
-    foreach ($x in ($belowMinAll | Sort-Object Version)) {
-      Uninstall-Entry $x
-    }
+    foreach ($x in ($belowMinAll | Sort-Object Version)) { Uninstall-Entry $x }
 
-    # Rescan and remove any stragglers below min
+    # Rescan & remove any remaining below-min entries
     $instX64b = if ($IncludeX64) { @(Get-VcEntries -Arch x64) } else { @() }
     $instX86b = if ($IncludeX86) { @(Get-VcEntries -Arch x86) } else { @() }
     $below2 = @()
     if ($IncludeX64) { $below2 += @($instX64b | Where-Object { $_.Version -lt $minKeep }) }
     if ($IncludeX86) { $below2 += @($instX86b | Where-Object { $_.Version -lt $minKeep }) }
+    $below2 = @($below2 | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 
     if ($below2.Count -gt 0) {
       Write-Log ("Removing remaining below-min VC++ entries: {0}" -f $below2.Count)
