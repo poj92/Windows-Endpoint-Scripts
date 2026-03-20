@@ -25,7 +25,6 @@ Exit codes:
   2 = report only; changes would be made
   3 = error
 #>
-
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [string]$MinKeepVersion,
