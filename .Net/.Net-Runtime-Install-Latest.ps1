@@ -1,30 +1,28 @@
 #Requires -Version 5.1
 <#
-DotNet-MinKeep-ConditionalInstall-Cleanup.ps1
+DotNet-MinKeep-ConditionalInstall-Cleanup.ps1 (FULL MERGED)
 
-What it does:
-- Reports installed .NET inventory: SDK + Runtime + ASP.NET Core + Windows Desktop (x64 + optional x86).
-- Removes versions below MinKeepVersion (best effort: uninstall tool + folder cleanup).
-- Installs latest for a family ONLY if that family has below-min versions detected (i.e. would be removed).
+Key behavior:
+- MinKeepVersion applies to SDK + Runtime + ASP.NET Core + Windows Desktop (folder + ARP views).
+- TargetChannel defaults to LTS channel derived from MinKeepVersion (major.minor) if not set.
+- Installs latest for a family ONLY if:
+    (a) there are below-min items for that family (ARP or folder), AND
+    (b) there is NOT already a compliant (>= MinKeepVersion) folder version for that family.
+- Removes below-min ARP packages (includes Windows Desktop Runtime entries that don't contain ".NET").
+- Dedupes ARP uninstalls to avoid duplicate 1605 spam; treats 1605/1614 as OK.
+- Performs folder cleanup (best-effort) and logs success/failure.
+- Post-check: logs remaining below-min ARP items.
 
-Channel selection:
-- TargetChannel defaults to major.minor of MinKeepVersion (prevents unintended upgrades to higher channels like 10.0).
-
-Datto env vars:
-  DotNet_MinKeepVersion (required)
-  DotNet_TargetChannel
-  DotNet_ReportOnly
-  DotNet_IncludeX86
-  DotNet_LatestLTSOnly
-  DotNet_ForceUninstallTool
-  DotNet_LogPath
-
-Exit codes:
-  0 = no action needed (no below-min versions found)
-  1 = changes made (installed and/or removed)
-  2 = report only; changes would be made
-  3 = error
+Datto RMM env vars:
+  DotNet_MinKeepVersion           (required)
+  DotNet_TargetChannel            (optional)
+  DotNet_ReportOnly               (optional, default false)
+  DotNet_IncludeX86               (optional, default false)
+  DotNet_LatestLTSOnly            (optional, default true)
+  DotNet_ForceUninstallTool       (optional, default false)
+  DotNet_LogPath                  (optional)
 #>
+
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [string]$MinKeepVersion,
@@ -92,6 +90,12 @@ function Format-VersionList($arr) {
   if($arr.Count -eq 0){ "<none>" } else { (($arr|Sort-Object|ForEach-Object{$_.ToString()}) -join ", ") }
 }
 function BelowMin($versions,[Version]$min){ @((Normalize-List $versions) | Where-Object { $_ -lt $min } | Sort-Object -Unique) }
+
+function Get-MaxVersion($versions) {
+  $v = @($versions) | Where-Object { $_ -ne $null } | Sort-Object -Descending
+  if ($v.Count -eq 0) { return $null }
+  return $v[0]
+}
 
 # ---------------- Release metadata ----------------
 function Get-LatestChannelInfo {
@@ -176,6 +180,23 @@ function Get-DotNetInventory([ValidateSet('x64','x86')]$Arch) {
     AspNet  = Get-VersionsFromDirs (Join-Path $root "shared\Microsoft.AspNetCore.App")
     Desktop = Get-VersionsFromDirs (Join-Path $root "shared\Microsoft.WindowsDesktop.App")
   }
+}
+
+function Has-CompliantFolderVersion {
+  param(
+    [ValidateSet('SDK','Runtime','AspNet','Desktop')]$Family,
+    [ValidateSet('x64','x86')]$Arch,
+    [Version]$MinKeepObj
+  )
+  $inv = Get-DotNetInventory $Arch
+  $list = switch ($Family) {
+    'SDK'     { $inv.SDK }
+    'Runtime' { $inv.Runtime }
+    'AspNet'  { $inv.AspNet }
+    'Desktop' { $inv.Desktop }
+  }
+  $max = Get-MaxVersion $list
+  return ($max -and $max -ge $MinKeepObj)
 }
 
 # ---------------- ARP below-min (includes Desktop Runtime) ----------------
@@ -327,6 +348,13 @@ try{
   Write-Log ("  Runtime : {0}" -f (Format-VersionList $invX64.Runtime))
   Write-Log ("  AspNet  : {0}" -f (Format-VersionList $invX64.AspNet))
   Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX64.Desktop))
+  if($IncludeX86){
+    Write-Log "Installed .NET inventory (folders) (x86):"
+    Write-Log ("  SDK     : {0}" -f (Format-VersionList $invX86.SDK))
+    Write-Log ("  Runtime : {0}" -f (Format-VersionList $invX86.Runtime))
+    Write-Log ("  AspNet  : {0}" -f (Format-VersionList $invX86.AspNet))
+    Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX86.Desktop))
+  }
 
   $belowArp = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
   Write-Log ("MinKeepVersion={0}" -f $minKeepObj)
@@ -355,16 +383,28 @@ try{
   $latest = Get-LatestInstallersForRelease -ReleasesJsonUrl $ch.ReleasesJsonUrl -LatestRelease $ch.LatestRelease
 
   if($ReportOnly){
-    Write-Log "ReportOnly: would install latest for families with below-min items, then uninstall below-min (including Desktop Runtime) via ARP."
+    Write-Log "ReportOnly: would install latest for families with below-min items (only if not already compliant), then uninstall below-min via ARP."
     exit 2
   }
 
-  if($need.Runtime){ Download-And-InstallExe $latest.RuntimeUrlX64 ".NET Runtime x64 $($latest.RuntimeVersion)" }
-  if($need.AspNet){  Download-And-InstallExe $latest.AspNetUrlX64 "ASP.NET Core Runtime x64 $($latest.AspNetVersion)" }
-  if($need.Desktop){ Download-And-InstallExe $latest.DesktopUrlX64 ".NET Desktop Runtime x64 $($latest.DesktopVersion)" }
-  if($need.SDK){     Download-And-InstallExe $latest.SdkUrlX64 ".NET SDK x64 $($latest.SdkVersion)" }
+  # Install latest only if needed AND not already compliant on disk
+  if($need.Runtime -and -not (Has-CompliantFolderVersion -Family Runtime -Arch x64 -MinKeepObj $minKeepObj)){
+    Download-And-InstallExe $latest.RuntimeUrlX64 ".NET Runtime x64 $($latest.RuntimeVersion)"
+  } else { if($need.Runtime){ Write-Log "Skipping Runtime install: compliant version already present." } }
 
-  # Dedup ARP uninstalls by uninstall command to avoid duplicate 1605 spam
+  if($need.AspNet -and -not (Has-CompliantFolderVersion -Family AspNet -Arch x64 -MinKeepObj $minKeepObj)){
+    Download-And-InstallExe $latest.AspNetUrlX64 "ASP.NET Core Runtime x64 $($latest.AspNetVersion)"
+  } else { if($need.AspNet){ Write-Log "Skipping AspNet install: compliant version already present." } }
+
+  if($need.Desktop -and -not (Has-CompliantFolderVersion -Family Desktop -Arch x64 -MinKeepObj $minKeepObj)){
+    Download-And-InstallExe $latest.DesktopUrlX64 ".NET Desktop Runtime x64 $($latest.DesktopVersion)"
+  } else { if($need.Desktop){ Write-Log "Skipping Desktop install: compliant version already present." } }
+
+  if($need.SDK -and -not (Has-CompliantFolderVersion -Family SDK -Arch x64 -MinKeepObj $minKeepObj)){
+    Download-And-InstallExe $latest.SdkUrlX64 ".NET SDK x64 $($latest.SdkVersion)"
+  } else { if($need.SDK){ Write-Log "Skipping SDK install: compliant version already present." } }
+
+  # Dedup ARP uninstalls by uninstall command
   $belowArp2 = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
   if($belowArp2.Count -gt 0){
     $groups = $belowArp2 | Group-Object -Property @{Expression={
@@ -378,6 +418,8 @@ try{
       $item = $g.Group | Select-Object -First 1
       Uninstall-ArpEntry $item.Entry -Force:$ForceUninstallTool
     }
+  } else {
+    Write-Log "No below-min ARP packages found to uninstall."
   }
 
   # Folder cleanup (best effort)
@@ -386,6 +428,15 @@ try{
   if($need.AspNet){  Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.AspNetCore.App") $minKeepObj }
   if($need.Desktop){ Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.WindowsDesktop.App") $minKeepObj }
   if($need.SDK){     Remove-FolderIfBelowMin (Join-Path $root64 "sdk") $minKeepObj }
+
+  # Post-check: remaining below-min ARP
+  $after = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
+  Write-Log ("Post-check: Below-min (ARP) remaining: {0}" -f $after.Count)
+  if ($after.Count -gt 0) {
+    foreach ($x in ($after | Sort-Object Family,Arch,Version)) {
+      Write-Log ("  Remaining below-min ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
+    }
+  }
 
   Write-Log "Done."
   exit 1
