@@ -26,7 +26,6 @@ Exit codes:
   3 = error
 #>
 
-#Requires -Version 5.1
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [string]$MinKeepVersion,
