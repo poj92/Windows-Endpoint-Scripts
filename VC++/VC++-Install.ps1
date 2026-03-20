@@ -28,6 +28,7 @@ Exit codes:
   3 = error
 #>
 
+
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [string]$TargetUrlX64,
@@ -78,6 +79,7 @@ function Write-Log([string]$Message) {
   Write-Host $line
   try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 } catch { }
 }
+
 function Ensure-Tls12 { try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { } }
 
 function Test-IsAdmin {
@@ -115,14 +117,33 @@ function Get-ArpEntries {
   }
 }
 
+function Get-VcArchFromName([string]$name) {
+  if (-not $name) { return $null }
+
+  # Ignore ARM64 entries for now (can be added later if you want)
+  if ($name -match '(?i)\barm64\b') { return $null }
+
+  # Match parentheses first, then plain tokens
+  if ($name -match '(?i)\(x64\)') { return 'x64' }
+  if ($name -match '(?i)\(x86\)') { return 'x86' }
+
+  # Older redistributables often use plain tokens: " x64 " / " x86 "
+  if ($name -match '(?i)\bx64\b') { return 'x64' }
+  if ($name -match '(?i)\bx86\b') { return 'x86' }
+
+  return $null
+}
+
 function Get-VcEntries([ValidateSet('x86','x64')]$Arch) {
   $all = @()
   foreach ($e in (Get-ArpEntries)) {
     if ($e.DisplayName -notmatch '^Microsoft Visual C\+\+') { continue }
-    if ($e.DisplayName -notmatch '\(x86\)|\(x64\)') { continue }
-    if ($Arch -eq 'x64' -and $e.DisplayName -notmatch '\(x64\)') { continue }
-    if ($Arch -eq 'x86' -and $e.DisplayName -notmatch '\(x86\)') { continue }
 
+    $detArch = Get-VcArchFromName $e.DisplayName
+    if (-not $detArch) { continue }
+    if ($detArch -ne $Arch) { continue }
+
+    # Version: prefer DisplayVersion, fall back to parsing from name
     $vv = Parse-VersionFlexible $e.DisplayVersion
     if (-not $vv) {
       $m = [regex]::Match($e.DisplayName, '(\d+\.\d+(?:\.\d+){0,2})')
@@ -132,13 +153,13 @@ function Get-VcEntries([ValidateSet('x86','x64')]$Arch) {
 
     $all += [pscustomobject]@{ Arch=$Arch; Version=$vv; Entry=$e }
   }
-  return @($all | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
+  @($all | Where-Object { $_ -ne $null -and $_.Entry -ne $null })
 }
 
 function Get-MaxVersion($list) {
   $arr = @($list) | Where-Object { $_ -ne $null -and $_.Version -ne $null }
   if ($arr.Count -eq 0) { return $null }
-  return ($arr | Sort-Object Version -Descending | Select-Object -First 1).Version
+  ($arr | Sort-Object Version -Descending | Select-Object -First 1).Version
 }
 
 function Normalize-MsiUninstall([string]$cmd) {
@@ -152,13 +173,11 @@ function Normalize-MsiUninstall([string]$cmd) {
     if ($args -notmatch '(?i)/norestart') { $args += ' /norestart' }
     return @{ Exe='msiexec.exe'; Args=$args }
   }
-
   return @{ Exe='cmd.exe'; Args="/c `"$cmd`"" }
 }
 
 function Uninstall-Entry($obj) {
   if (-not $obj -or -not $obj.Entry) { return }
-
   $e = $obj.Entry
   $cmd = $e.QuietUninstallString
   if (-not $cmd) { $cmd = $e.UninstallString }
@@ -181,10 +200,7 @@ function Install-FromExe([string]$InstallerPath, [string]$Label) {
   Write-Log "Installing $Label (silent)..."
   $p = Start-Process -FilePath $InstallerPath -ArgumentList "/install /quiet /norestart" -Wait -PassThru -NoNewWindow
   Write-Log ("Install exit code: {0}" -f $p.ExitCode)
-
-  if (@(0,3010,1638,1641) -notcontains $p.ExitCode) {
-    throw "$Label installer failed (exit $($p.ExitCode))."
-  }
+  if (@(0,3010,1638,1641) -notcontains $p.ExitCode) { throw "$Label installer failed (exit $($p.ExitCode))." }
 }
 
 # ---------------- MAIN ----------------
@@ -200,7 +216,6 @@ try {
   $minKeep = Parse-VersionFlexible $MinKeepVersion
   if (-not $minKeep) { throw "Invalid MinKeepVersion '$MinKeepVersion'." }
 
-  # Inventory - always treat as arrays for logging/logic
   $instX64 = if ($IncludeX64) { @((Get-VcEntries -Arch x64) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
   $instX86 = if ($IncludeX86) { @((Get-VcEntries -Arch x86) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
 
@@ -211,10 +226,23 @@ try {
   Write-Log ("Highest detected versions: x64={0} x86={1}" -f ($(if ($maxX64) { $maxX64 } else { "<none>" })), ($(if ($maxX86) { $maxX86 } else { "<none>" })))
   Write-Log ("MinKeepVersion (remove below): {0}" -f $minKeep)
 
+  # Extra: show exactly what was detected (helpful for troubleshooting)
+  if (@($instX64).Count -gt 0) {
+    Write-Log "Detected x64 VC++ entries:"
+    foreach ($x in ($instX64 | Sort-Object Version)) {
+      Write-Log ("  - {0} => {1}" -f $x.Entry.DisplayName, $x.Version)
+    }
+  }
+  if (@($instX86).Count -gt 0) {
+    Write-Log "Detected x86 VC++ entries:"
+    foreach ($x in ($instX86 | Sort-Object Version)) {
+      Write-Log ("  - {0} => {1}" -f $x.Entry.DisplayName, $x.Version)
+    }
+  }
+
   $belowMinX64 = if ($IncludeX64) { @($instX64 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
   $belowMinX86 = if ($IncludeX86) { @($instX86 | Where-Object { $_.Version -lt $minKeep }) } else { @() }
 
-  # FIX: do NOT use '+' on objects; use += to build a real array
   $belowMinAll = @()
   $belowMinAll += @($belowMinX64)
   $belowMinAll += @($belowMinX86)
@@ -227,7 +255,7 @@ try {
     exit 0
   }
 
-  # URLs only required if that arch has below-min entries
+  # URLs required only if that architecture has below-min entries
   if ($IncludeX64 -and (@($belowMinX64).Count -gt 0) -and -not $TargetUrlX64) { throw "Missing VCRedist_TargetUrl_X64 (needed because x64 has below-min entries)." }
   if ($IncludeX86 -and (@($belowMinX86).Count -gt 0) -and -not $TargetUrlX86) { throw "Missing VCRedist_TargetUrl_X86 (needed because x86 has below-min entries)." }
 
@@ -261,7 +289,7 @@ try {
     Write-Log "Removing installed VC++ entries below MinKeepVersion..."
     foreach ($x in ($belowMinAll | Sort-Object Version)) { Uninstall-Entry $x }
 
-    # Rescan and remove any remaining below-min entries
+    # Rescan & remove any remaining below-min entries
     $instX64b = if ($IncludeX64) { @((Get-VcEntries -Arch x64) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
     $instX86b = if ($IncludeX86) { @((Get-VcEntries -Arch x86) | Where-Object { $_ -ne $null -and $_.Entry -ne $null }) } else { @() }
 
