@@ -52,19 +52,18 @@ function Get-EnvBool([string]$Name, [bool]$Default=$false) {
   }
 }
 
-if (-not $PSBoundParameters.ContainsKey('MinKeepVersion'))     { $MinKeepVersion = Get-Env 'DotNet_MinKeepVersion' }
-if (-not $PSBoundParameters.ContainsKey('TargetChannel'))      { $TargetChannel  = Get-Env 'DotNet_TargetChannel' }
-if (-not $PSBoundParameters.ContainsKey('ReportOnly'))         { $ReportOnly     = Get-EnvBool 'DotNet_ReportOnly' $false }
-if (-not $PSBoundParameters.ContainsKey('IncludeX86'))         { $IncludeX86     = Get-EnvBool 'DotNet_IncludeX86' $false }
-# Default to LTS-only unless explicitly set otherwise
-if (-not $PSBoundParameters.ContainsKey('LatestLTSOnly'))      { $LatestLTSOnly  = Get-EnvBool 'DotNet_LatestLTSOnly' $true }
+if (-not $PSBoundParameters.ContainsKey('MinKeepVersion'))   { $MinKeepVersion = Get-Env 'DotNet_MinKeepVersion' }
+if (-not $PSBoundParameters.ContainsKey('TargetChannel'))    { $TargetChannel  = Get-Env 'DotNet_TargetChannel' }
+if (-not $PSBoundParameters.ContainsKey('ReportOnly'))       { $ReportOnly     = Get-EnvBool 'DotNet_ReportOnly' $false }
+if (-not $PSBoundParameters.ContainsKey('IncludeX86'))       { $IncludeX86     = Get-EnvBool 'DotNet_IncludeX86' $false }
+if (-not $PSBoundParameters.ContainsKey('LatestLTSOnly'))    { $LatestLTSOnly  = Get-EnvBool 'DotNet_LatestLTSOnly' $true }  # default LTS
 if (-not $PSBoundParameters.ContainsKey('ForceUninstallTool')) { $ForceUninstallTool = Get-EnvBool 'DotNet_ForceUninstallTool' $false }
 if (-not $PSBoundParameters.ContainsKey('LogPath')) {
   $lp = Get-Env 'DotNet_LogPath'
   if ($lp) { $LogPath = $lp }
 }
 
-# ---------------- logging / utilities ----------------
+# ---------------- logging / utils ----------------
 function Write-Log([string]$Message) {
   $dir = Split-Path -Parent $LogPath
   if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
@@ -74,12 +73,11 @@ function Write-Log([string]$Message) {
   try { Add-Content -Path $LogPath -Value $line -Encoding UTF8 } catch { }
 }
 function Ensure-Tls12 { try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { } }
+function Normalize-List($obj) { @($obj) | Where-Object { $_ -ne $null } }
 function Test-IsAdmin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
-function Normalize-List($obj) { @($obj) | Where-Object { $_ -ne $null } }
-
 function Parse-Version3Or4([string]$v) {
   if (-not $v) { return $null }
   $m = [regex]::Match($v.Trim(), '^(\d+)\.(\d+)(?:\.(\d+))?(?:\.(\d+))?')
@@ -90,8 +88,13 @@ function Parse-Version3Or4([string]$v) {
   [Version]("$a.$b.$c.$d")
 }
 function Derive-Channel([Version]$minKeepObj) { "{0}.{1}" -f $minKeepObj.Major, $minKeepObj.Minor }
+function Format-VersionList($arr) {
+  $arr=Normalize-List $arr
+  if($arr.Count -eq 0){ "<none>" } else { (($arr|Sort-Object|ForEach-Object{$_.ToString()}) -join ", ") }
+}
+function BelowMin($versions,[Version]$min){ @((Normalize-List $versions) | Where-Object { $_ -lt $min } | Sort-Object -Unique) }
 
-# ---------------- release metadata ----------------
+# ---------------- Release metadata ----------------
 function Get-LatestChannelInfo {
   param([string]$ChannelVersion, [switch]$LtsOnly)
 
@@ -154,7 +157,7 @@ function Get-LatestInstallersForRelease {
   }
 }
 
-# ---------------- Inventory from filesystem ----------------
+# ---------------- Folder inventory ----------------
 function Get-DotNetRoot([ValidateSet('x64','x86')]$Arch) { if($Arch -eq 'x86'){"C:\Program Files (x86)\dotnet"}else{"C:\Program Files\dotnet"} }
 function Get-VersionsFromDirs([string]$Path) {
   if(-not (Test-Path $Path)){ return @() }
@@ -175,13 +178,8 @@ function Get-DotNetInventory([ValidateSet('x64','x86')]$Arch) {
     Desktop = Get-VersionsFromDirs (Join-Path $root "shared\Microsoft.WindowsDesktop.App")
   }
 }
-function Format-VersionList($arr) {
-  $arr=Normalize-List $arr
-  if($arr.Count -eq 0){ "<none>" } else { (($arr|Sort-Object|ForEach-Object{$_.ToString()}) -join ", ") }
-}
-function BelowMin($versions,[Version]$min){ @((Normalize-List $versions) | Where-Object { $_ -lt $min } | Sort-Object -Unique) }
 
-# ---------------- ARP fallback uninstall ----------------
+# ---------------- ARP (Apps & Features) inventory + uninstall ----------------
 function Get-ArpEntries {
   $paths=@(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -208,29 +206,34 @@ function Get-ArchFromName([string]$name){
   $null
 }
 
-function Get-DotNetArpPackagesBelowMin {
-  param([Version]$MinKeep,[switch]$IncludeX86,[hashtable]$Need)
+function Classify-DotNetArpFamily([string]$dn){
+  if(-not $dn){return $null}
+  if($dn -match '(?i)Windows Desktop Runtime'){ return 'Desktop' }
+  if($dn -match '(?i)ASP\.NET Core'){ return 'AspNet' }
+  if($dn -match '(?i)\.NET Runtime|Microsoft \.NET Runtime'){ return 'Runtime' }
+  if($dn -match '(?i)\.NET SDK|\bSDK\b'){ return 'SDK' }
+  if($dn -match '(?i)\.NET Host FX Resolver'){ return 'HostFxr' }
+  if($dn -match '(?i)\.NET Host\b'){ return 'Host' }
+  if($dn -match '(?i)\bHosting Bundle\b'){ return 'HostingBundle' }
+  $null
+}
 
-  $wantArch=@('x64'); if($IncludeX86){ $wantArch += 'x86' }
-
+function Get-DotNetArpBelowMin([Version]$MinKeep,[switch]$IncludeX86){
+  $want=@('x64'); if($IncludeX86){$want+= 'x86'}
   $out=@()
   foreach($e in Get-ArpEntries){
     $dn=[string]$e.DisplayName
-    if($dn -notmatch '(?i)\bMicrosoft\b.*\b\.NET\b' -and $dn -notmatch '(?i)\bASP\.NET\b'){ continue }
+
+    # FIX: include Desktop Runtime even if it doesn't contain ".NET"
+    if($dn -notmatch '(?i)\bMicrosoft\b' ){ continue }
+    if($dn -notmatch '(?i)\.NET|ASP\.NET|Windows Desktop Runtime|Hosting Bundle'){ continue }
+
+    $fam = Classify-DotNetArpFamily $dn
+    if(-not $fam){ continue }
 
     $arch = Get-ArchFromName $dn
-    if(-not $arch -or $arch -eq 'arm64'){ continue }
-    if($wantArch -notcontains $arch){ continue }
-
-    $family = $null
-    if($dn -match '(?i)\bSDK\b'){ $family='SDK' }
-    elseif($dn -match '(?i)Windows Desktop Runtime'){ $family='Desktop' }
-    elseif($dn -match '(?i)ASP\.NET Core'){ $family='AspNet' }
-    elseif($dn -match '(?i)\.NET Runtime'){ $family='Runtime' }
-    elseif($dn -match '(?i)Microsoft \.NET Runtime'){ $family='Runtime' }
-
-    if(-not $family){ continue }
-    if(-not $Need[$family]){ continue } # only consider families we intend to clean
+    if($arch -eq 'arm64'){ continue }
+    if($arch -and ($want -notcontains $arch) -and $fam -ne 'HostingBundle'){ continue }
 
     $ver = Parse-Version3Or4 $e.DisplayVersion
     if(-not $ver){
@@ -240,7 +243,7 @@ function Get-DotNetArpPackagesBelowMin {
     if(-not $ver){ continue }
 
     if($ver -lt $MinKeep){
-      $out += [pscustomobject]@{ Family=$family; Arch=$arch; Version=$ver; Entry=$e }
+      $out += [pscustomobject]@{ Family=$fam; Arch=($arch ?? ''); Version=$ver; Entry=$e }
     }
   }
   $out
@@ -266,7 +269,13 @@ function Uninstall-ArpEntry($entry,[switch]$Force){
   $n=Normalize-MsiUninstall $cmd -Force:$Force
   Write-Log ("ARP uninstall: {0} ({1})" -f $entry.DisplayName, $entry.DisplayVersion)
   $p=Start-Process -FilePath $n.Exe -ArgumentList $n.Args -Wait -PassThru -NoNewWindow
-  Write-Log ("ARP uninstall exit={0}" -f $p.ExitCode)
+
+  # Treat already-uninstalled as OK
+  if(@(0,1605,1614,3010) -contains $p.ExitCode){
+    Write-Log ("ARP uninstall exit={0} (ok)" -f $p.ExitCode)
+  } else {
+    Write-Log ("WARNING: ARP uninstall exit={0}" -f $p.ExitCode)
+  }
 }
 
 # ---------------- install + folder cleanup ----------------
@@ -300,14 +309,13 @@ function Remove-FolderIfBelowMin([string]$path,[Version]$min){
 # ---------------- MAIN ----------------
 try{
   if(-not (Test-IsAdmin)){ throw "Run elevated (Administrator / SYSTEM)." }
-  if(-not $MinKeepVersion){ throw "DotNet_MinKeepVersion is required (e.g. 8.0.0)." }
+  if(-not $MinKeepVersion){ throw "DotNet_MinKeepVersion is required." }
 
   $minKeepObj = Parse-Version3Or4 $MinKeepVersion
   if(-not $minKeepObj){ throw "MinKeepVersion '$MinKeepVersion' is invalid." }
 
-  $derived = Derive-Channel $minKeepObj
   if(-not $TargetChannel){
-    $TargetChannel = $derived
+    $TargetChannel = Derive-Channel $minKeepObj
     $LatestLTSOnly = $true
     Write-Log ("TargetChannel not set. Defaulting to LTS channel derived from MinKeepVersion: '{0}'" -f $TargetChannel)
   }
@@ -318,56 +326,51 @@ try{
   $invX64=Get-DotNetInventory x64
   $invX86= if($IncludeX86){ Get-DotNetInventory x86 } else { $null }
 
-  Write-Log "Installed .NET inventory (x64):"
+  Write-Log "Installed .NET inventory (folders) (x64):"
   Write-Log ("  SDK     : {0}" -f (Format-VersionList $invX64.SDK))
   Write-Log ("  Runtime : {0}" -f (Format-VersionList $invX64.Runtime))
   Write-Log ("  AspNet  : {0}" -f (Format-VersionList $invX64.AspNet))
   Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX64.Desktop))
-
   if($IncludeX86){
-    Write-Log "Installed .NET inventory (x86):"
+    Write-Log "Installed .NET inventory (folders) (x86):"
     Write-Log ("  SDK     : {0}" -f (Format-VersionList $invX86.SDK))
     Write-Log ("  Runtime : {0}" -f (Format-VersionList $invX86.Runtime))
     Write-Log ("  AspNet  : {0}" -f (Format-VersionList $invX86.AspNet))
     Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX86.Desktop))
   }
 
-  # Below-min per family/arch (IMPORTANT: per-arch drives per-arch installs)
-  $belowX64=@{
-    SDK     = BelowMin $invX64.SDK     $minKeepObj
-    Runtime = BelowMin $invX64.Runtime $minKeepObj
-    AspNet  = BelowMin $invX64.AspNet  $minKeepObj
-    Desktop = BelowMin $invX64.Desktop $minKeepObj
+  $belowFolders=@{
+    SDK     = (BelowMin $invX64.SDK     $minKeepObj)
+    Runtime = (BelowMin $invX64.Runtime $minKeepObj)
+    AspNet  = (BelowMin $invX64.AspNet  $minKeepObj)
+    Desktop = (BelowMin $invX64.Desktop $minKeepObj)
   }
-  $belowX86=@{ SDK=@(); Runtime=@(); AspNet=@(); Desktop=@() }
   if($IncludeX86){
-    $belowX86.SDK     = BelowMin $invX86.SDK     $minKeepObj
-    $belowX86.Runtime = BelowMin $invX86.Runtime $minKeepObj
-    $belowX86.AspNet  = BelowMin $invX86.AspNet  $minKeepObj
-    $belowX86.Desktop = BelowMin $invX86.Desktop $minKeepObj
+    $belowFolders.SDK     += (BelowMin $invX86.SDK     $minKeepObj)
+    $belowFolders.Runtime += (BelowMin $invX86.Runtime $minKeepObj)
+    $belowFolders.AspNet  += (BelowMin $invX86.AspNet  $minKeepObj)
+    $belowFolders.Desktop += (BelowMin $invX86.Desktop $minKeepObj)
   }
+  foreach($k in @('SDK','Runtime','AspNet','Desktop')){ $belowFolders[$k]=@($belowFolders[$k]|Sort-Object -Unique) }
 
+  $belowArp = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
   Write-Log ("MinKeepVersion={0}" -f $minKeepObj)
-  Write-Log ("Below-min detected x64: SDK={0} Runtime={1} AspNet={2} Desktop={3}" -f `
-    $belowX64.SDK.Count, $belowX64.Runtime.Count, $belowX64.AspNet.Count, $belowX64.Desktop.Count)
-  if($IncludeX86){
-    Write-Log ("Below-min detected x86: SDK={0} Runtime={1} AspNet={2} Desktop={3}" -f `
-      $belowX86.SDK.Count, $belowX86.Runtime.Count, $belowX86.AspNet.Count, $belowX86.Desktop.Count)
+  Write-Log ("Below-min (folders): SDK={0} Runtime={1} AspNet={2} Desktop={3}" -f `
+    $belowFolders.SDK.Count, $belowFolders.Runtime.Count, $belowFolders.AspNet.Count, $belowFolders.Desktop.Count)
+  Write-Log ("Below-min (ARP): {0} item(s)" -f $belowArp.Count)
+
+  $need=@{
+    SDK     = ($belowFolders.SDK.Count     -gt 0) -or (@($belowArp|Where-Object{$_.Family -eq 'SDK'}).Count -gt 0)
+    Runtime = ($belowFolders.Runtime.Count -gt 0) -or (@($belowArp|Where-Object{$_.Family -eq 'Runtime'}).Count -gt 0)
+    AspNet  = ($belowFolders.AspNet.Count  -gt 0) -or (@($belowArp|Where-Object{$_.Family -eq 'AspNet'}).Count -gt 0)
+    Desktop = ($belowFolders.Desktop.Count -gt 0) -or (@($belowArp|Where-Object{$_.Family -eq 'Desktop'}).Count -gt 0)
   }
 
-  $needFamily=@{
-    SDK     = ($belowX64.SDK.Count -gt 0)     -or ($IncludeX86 -and $belowX86.SDK.Count -gt 0)
-    Runtime = ($belowX64.Runtime.Count -gt 0) -or ($IncludeX86 -and $belowX86.Runtime.Count -gt 0)
-    AspNet  = ($belowX64.AspNet.Count -gt 0)  -or ($IncludeX86 -and $belowX86.AspNet.Count -gt 0)
-    Desktop = ($belowX64.Desktop.Count -gt 0) -or ($IncludeX86 -and $belowX86.Desktop.Count -gt 0)
-  }
-
-  if(-not ($needFamily.SDK -or $needFamily.Runtime -or $needFamily.AspNet -or $needFamily.Desktop)){
+  if(-not ($need.SDK -or $need.Runtime -or $need.AspNet -or $need.Desktop)){
     Write-Log "No versions below MinKeepVersion were found. Skipping install by design."
     exit 0
   }
 
-  # Resolve channel (LTS by default). If requested channel doesn't exist as active LTS, fall back to highest active LTS.
   $ch = Get-LatestChannelInfo -ChannelVersion $TargetChannel -LtsOnly:$LatestLTSOnly
   if(-not $ch -and $LatestLTSOnly){
     Write-Log ("WARNING: No active LTS channel found for '{0}'. Falling back to highest active LTS." -f $TargetChannel)
@@ -381,77 +384,48 @@ try{
     $ch.ChannelVersion, $latest.SdkVersion, $latest.RuntimeVersion, $latest.AspNetVersion, $latest.DesktopVersion)
 
   if($ReportOnly){
-    Write-Log "ReportOnly: would install latest ONLY for families/arches where below-min exists, then remove below-min."
+    Write-Log "ReportOnly: would install latest for families with below-min items, then uninstall below-min ARP items (including Desktop Runtime)."
     exit 2
   }
 
-  # Install per arch only if that arch has below-min for that family
-  if($belowX64.Runtime.Count -gt 0){ Download-And-InstallExe $latest.RuntimeUrlX64 ".NET Runtime x64 $($latest.RuntimeVersion)" }
-  if($IncludeX86 -and $belowX86.Runtime.Count -gt 0){ Download-And-InstallExe $latest.RuntimeUrlX86 ".NET Runtime x86 $($latest.RuntimeVersion)" }
-
-  if($belowX64.AspNet.Count -gt 0){ Download-And-InstallExe $latest.AspNetUrlX64 "ASP.NET Core Runtime x64 $($latest.AspNetVersion)" }
-  if($IncludeX86 -and $belowX86.AspNet.Count -gt 0){ Download-And-InstallExe $latest.AspNetUrlX86 "ASP.NET Core Runtime x86 $($latest.AspNetVersion)" }
-
-  if($belowX64.Desktop.Count -gt 0){ Download-And-InstallExe $latest.DesktopUrlX64 ".NET Desktop Runtime x64 $($latest.DesktopVersion)" }
-  if($IncludeX86 -and $belowX86.Desktop.Count -gt 0){ Download-And-InstallExe $latest.DesktopUrlX86 ".NET Desktop Runtime x86 $($latest.DesktopVersion)" }
-
-  if($belowX64.SDK.Count -gt 0){ Download-And-InstallExe $latest.SdkUrlX64 ".NET SDK x64 $($latest.SdkVersion)" }
-  if($IncludeX86 -and $belowX86.SDK.Count -gt 0){ Download-And-InstallExe $latest.SdkUrlX86 ".NET SDK x86 $($latest.SdkVersion)" }
-
-  # Remove below-min: prefer dotnet-core-uninstall if available, else ARP uninstall
-  $tool = Get-Command dotnet-core-uninstall.exe -ErrorAction SilentlyContinue
-  if($tool){
-    Write-Log "dotnet-core-uninstall found; using it for removals."
-    # (optional: you can add tool remove calls here; keeping ARP fallback as the robust path)
-  } else {
-    Write-Log "dotnet-core-uninstall not found; using ARP uninstall fallback."
-  }
-
-  $pkgs = Get-DotNetArpPackagesBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86 -Need $needFamily
-  if($pkgs.Count -gt 0){
-    Write-Log ("ARP packages below min to remove: {0}" -f $pkgs.Count)
-    foreach($p in ($pkgs | Sort-Object Family,Arch,Version)){
-      Uninstall-ArpEntry $p.Entry -Force:$ForceUninstallTool
-    }
-  } else {
-    Write-Log "No ARP .NET packages below min were found to uninstall (may have been folder-only installs)."
-  }
-
-  # Folder cleanup with real success/failure logging (only for families we detected below-min)
-  $arches=@('x64'); if($IncludeX86){$arches+= 'x86'}
-  foreach($arch in $arches){
-    $root=Get-DotNetRoot $arch
-    if($belowX64.SDK.Count -gt 0 -or ($arch -eq 'x86' -and $belowX86.SDK.Count -gt 0)){ Remove-FolderIfBelowMin (Join-Path $root "sdk") $minKeepObj }
-    if($belowX64.Runtime.Count -gt 0 -or ($arch -eq 'x86' -and $belowX86.Runtime.Count -gt 0)){ Remove-FolderIfBelowMin (Join-Path $root "shared\Microsoft.NETCore.App") $minKeepObj }
-    if($belowX64.AspNet.Count -gt 0 -or ($arch -eq 'x86' -and $belowX86.AspNet.Count -gt 0)){ Remove-FolderIfBelowMin (Join-Path $root "shared\Microsoft.AspNetCore.App") $minKeepObj }
-    if($belowX64.Desktop.Count -gt 0 -or ($arch -eq 'x86' -and $belowX86.Desktop.Count -gt 0)){ Remove-FolderIfBelowMin (Join-Path $root "shared\Microsoft.WindowsDesktop.App") $minKeepObj }
-  }
-
-  # Final inventory + verify remaining below-min
-  $finalX64=Get-DotNetInventory x64
-  $finalX86= if($IncludeX86){ Get-DotNetInventory x86 } else { $null }
-
-  Write-Log "Final .NET inventory (x64):"
-  Write-Log ("  SDK     : {0}" -f (Format-VersionList $finalX64.SDK))
-  Write-Log ("  Runtime : {0}" -f (Format-VersionList $finalX64.Runtime))
-  Write-Log ("  AspNet  : {0}" -f (Format-VersionList $finalX64.AspNet))
-  Write-Log ("  Desktop : {0}" -f (Format-VersionList $finalX64.Desktop))
+  if($need.Runtime){ Download-And-InstallExe $latest.RuntimeUrlX64 ".NET Runtime x64 $($latest.RuntimeVersion)" }
+  if($need.AspNet){  Download-And-InstallExe $latest.AspNetUrlX64 "ASP.NET Core Runtime x64 $($latest.AspNetVersion)" }
+  if($need.Desktop){ Download-And-InstallExe $latest.DesktopUrlX64 ".NET Desktop Runtime x64 $($latest.DesktopVersion)" }
+  if($need.SDK){     Download-And-InstallExe $latest.SdkUrlX64 ".NET SDK x64 $($latest.SdkVersion)" }
 
   if($IncludeX86){
-    Write-Log "Final .NET inventory (x86):"
-    Write-Log ("  SDK     : {0}" -f (Format-VersionList $finalX86.SDK))
-    Write-Log ("  Runtime : {0}" -f (Format-VersionList $finalX86.Runtime))
-    Write-Log ("  AspNet  : {0}" -f (Format-VersionList $finalX86.AspNet))
-    Write-Log ("  Desktop : {0}" -f (Format-VersionList $finalX86.Desktop))
+    # only install x86 if there are any x86 below-min ARP items
+    $needX86 = (@($belowArp | Where-Object { $_.Arch -eq 'x86' }).Count -gt 0)
+    if($needX86){
+      if($need.Runtime -and $latest.RuntimeUrlX86){ Download-And-InstallExe $latest.RuntimeUrlX86 ".NET Runtime x86 $($latest.RuntimeVersion)" }
+      if($need.AspNet  -and $latest.AspNetUrlX86){  Download-And-InstallExe $latest.AspNetUrlX86  "ASP.NET Core Runtime x86 $($latest.AspNetVersion)" }
+      if($need.Desktop -and $latest.DesktopUrlX86){ Download-And-InstallExe $latest.DesktopUrlX86 ".NET Desktop Runtime x86 $($latest.DesktopVersion)" }
+      if($need.SDK     -and $latest.SdkUrlX86){     Download-And-InstallExe $latest.SdkUrlX86 ".NET SDK x86 $($latest.SdkVersion)" }
+    }
   }
 
-  $rem = @{
-    SDK     = (BelowMin $finalX64.SDK     $minKeepObj).Count + $(if($IncludeX86){(BelowMin $finalX86.SDK $minKeepObj).Count}else{0})
-    Runtime = (BelowMin $finalX64.Runtime $minKeepObj).Count + $(if($IncludeX86){(BelowMin $finalX86.Runtime $minKeepObj).Count}else{0})
-    AspNet  = (BelowMin $finalX64.AspNet  $minKeepObj).Count + $(if($IncludeX86){(BelowMin $finalX86.AspNet $minKeepObj).Count}else{0})
-    Desktop = (BelowMin $finalX64.Desktop $minKeepObj).Count + $(if($IncludeX86){(BelowMin $finalX86.Desktop $minKeepObj).Count}else{0})
+  # Uninstall below-min ARP entries (DEDUPED)
+  $belowArp2 = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
+  if($belowArp2.Count -gt 0){
+    Write-Log ("ARP packages below min to remove: {0}" -f $belowArp2.Count)
+
+    # Deduplicate by uninstall command (prevents duplicate 1605 spam)
+    $groups = $belowArp2 | Group-Object -Property @{Expression={
+      ($_.Entry.QuietUninstallString ?? $_.Entry.UninstallString ?? $_.Entry.DisplayName)
+    }}
+
+    foreach($g in $groups){
+      $item = $g.Group | Select-Object -First 1
+      Uninstall-ArpEntry $item.Entry -Force:$ForceUninstallTool
+    }
   }
-  Write-Log ("Remaining below-min after cleanup: SDK={0} Runtime={1} AspNet={2} Desktop={3}" -f $rem.SDK,$rem.Runtime,$rem.AspNet,$rem.Desktop)
+
+  # Folder cleanup (best effort)
+  $root64 = Get-DotNetRoot x64
+  if($need.SDK)     { Remove-FolderIfBelowMin (Join-Path $root64 "sdk") $minKeepObj }
+  if($need.Runtime) { Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.NETCore.App") $minKeepObj }
+  if($need.AspNet)  { Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.AspNetCore.App") $minKeepObj }
+  if($need.Desktop) { Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.WindowsDesktop.App") $minKeepObj }
 
   Write-Log "Done."
   exit 1
