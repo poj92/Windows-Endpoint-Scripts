@@ -22,7 +22,6 @@ Datto RMM env vars:
   DotNet_ForceUninstallTool       (optional, default false)
   DotNet_LogPath                  (optional)
 #>
-
 [CmdletBinding(SupportsShouldProcess=$true)]
 param(
   [string]$MinKeepVersion,
@@ -49,11 +48,11 @@ function Get-EnvBool([string]$Name, [bool]$Default=$false) {
   }
 }
 
-if (-not $PSBoundParameters.ContainsKey('MinKeepVersion'))   { $MinKeepVersion = Get-Env 'DotNet_MinKeepVersion' }
-if (-not $PSBoundParameters.ContainsKey('TargetChannel'))    { $TargetChannel  = Get-Env 'DotNet_TargetChannel' }
-if (-not $PSBoundParameters.ContainsKey('ReportOnly'))       { $ReportOnly     = Get-EnvBool 'DotNet_ReportOnly' $false }
-if (-not $PSBoundParameters.ContainsKey('IncludeX86'))       { $IncludeX86     = Get-EnvBool 'DotNet_IncludeX86' $false }
-if (-not $PSBoundParameters.ContainsKey('LatestLTSOnly'))    { $LatestLTSOnly  = Get-EnvBool 'DotNet_LatestLTSOnly' $true }  # default LTS
+if (-not $PSBoundParameters.ContainsKey('MinKeepVersion'))     { $MinKeepVersion = Get-Env 'DotNet_MinKeepVersion' }
+if (-not $PSBoundParameters.ContainsKey('TargetChannel'))      { $TargetChannel  = Get-Env 'DotNet_TargetChannel' }
+if (-not $PSBoundParameters.ContainsKey('ReportOnly'))         { $ReportOnly     = Get-EnvBool 'DotNet_ReportOnly' $false }
+if (-not $PSBoundParameters.ContainsKey('IncludeX86'))         { $IncludeX86     = Get-EnvBool 'DotNet_IncludeX86' $false }
+if (-not $PSBoundParameters.ContainsKey('LatestLTSOnly'))      { $LatestLTSOnly  = Get-EnvBool 'DotNet_LatestLTSOnly' $true }  # default LTS
 if (-not $PSBoundParameters.ContainsKey('ForceUninstallTool')) { $ForceUninstallTool = Get-EnvBool 'DotNet_ForceUninstallTool' $false }
 if (-not $PSBoundParameters.ContainsKey('LogPath')) {
   $lp = Get-Env 'DotNet_LogPath'
@@ -199,7 +198,7 @@ function Has-CompliantFolderVersion {
   return ($max -and $max -ge $MinKeepObj)
 }
 
-# ---------------- ARP below-min (includes Desktop Runtime) ----------------
+# ---------------- ARP below-min (ALWAYS RETURNS ARRAY) ----------------
 function Get-ArpEntries {
   $paths=@(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
@@ -217,7 +216,6 @@ function Get-ArpEntries {
     }
   }
 }
-
 function Get-ArchFromName([string]$name){
   if(-not $name){return $null}
   if($name -match '(?i)\barm64\b'){ return 'arm64' }
@@ -225,7 +223,6 @@ function Get-ArchFromName([string]$name){
   if($name -match '(?i)\(x86\)|\bx86\b'){ return 'x86' }
   $null
 }
-
 function Classify-DotNetArpFamily([string]$dn){
   if(-not $dn){return $null}
   if($dn -match '(?i)Windows Desktop Runtime'){ return 'Desktop' }
@@ -265,7 +262,7 @@ function Get-DotNetArpBelowMin([Version]$MinKeep,[switch]$IncludeX86){
       $out += [pscustomobject]@{ Family=$fam; Arch=$archOut; Version=$ver; Entry=$e }
     }
   }
-  $out
+  return ,$out  # <-- critical: always return an array, even with 0/1 items
 }
 
 function Normalize-MsiUninstall([string]$cmd,[switch]$Force){
@@ -279,7 +276,6 @@ function Normalize-MsiUninstall([string]$cmd,[switch]$Force){
   }
   @{Exe='cmd.exe'; Args="/c `"$cmd`""}
 }
-
 function Uninstall-ArpEntry($entry,[switch]$Force){
   $cmd=$entry.QuietUninstallString
   if(-not $cmd){ $cmd=$entry.UninstallString }
@@ -356,9 +352,12 @@ try{
     Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX86.Desktop))
   }
 
-  $belowArp = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
+  $belowArp = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
   Write-Log ("MinKeepVersion={0}" -f $minKeepObj)
-  Write-Log ("Below-min (ARP): {0} item(s)" -f $belowArp.Count)
+  Write-Log ("Below-min (ARP): {0} item(s)" -f @($belowArp).Count)
+  foreach($x in ($belowArp | Sort-Object Family,Arch,Version)){
+    Write-Log ("  Below-min ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
+  }
 
   $need=@{
     SDK     = (@($belowArp|Where-Object{$_.Family -eq 'SDK'}).Count -gt 0)     -or ((BelowMin $invX64.SDK $minKeepObj).Count -gt 0)
@@ -367,7 +366,7 @@ try{
     Desktop = (@($belowArp|Where-Object{$_.Family -eq 'Desktop'}).Count -gt 0) -or ((BelowMin $invX64.Desktop $minKeepObj).Count -gt 0)
   }
 
-  if(-not ($need.SDK -or $need.Runtime -or $need.AspNet -or $need.Desktop)){
+  if(-not ($need.SDK -or $need.Runtime -or $need.AspNet -or $need.Desktop -or @($belowArp).Count -gt 0)){
     Write-Log "No versions below MinKeepVersion were found. Skipping install by design."
     exit 0
   }
@@ -404,16 +403,16 @@ try{
     Download-And-InstallExe $latest.SdkUrlX64 ".NET SDK x64 $($latest.SdkVersion)"
   } else { if($need.SDK){ Write-Log "Skipping SDK install: compliant version already present." } }
 
-  # Dedup ARP uninstalls by uninstall command
-  $belowArp2 = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
-  if($belowArp2.Count -gt 0){
+  # Dedup ARP uninstalls by uninstall command (now works even when only 1 item exists)
+  $belowArp2 = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
+  if(@($belowArp2).Count -gt 0){
     $groups = $belowArp2 | Group-Object -Property @{Expression={
       $cmd = $_.Entry.QuietUninstallString
       if(-not $cmd){ $cmd = $_.Entry.UninstallString }
       if(-not $cmd){ $cmd = $_.Entry.DisplayName }
       $cmd
     }}
-    Write-Log ("ARP packages below min to remove: {0} (dedup groups={1})" -f $belowArp2.Count, $groups.Count)
+    Write-Log ("ARP packages below min to remove: {0} (dedup groups={1})" -f @($belowArp2).Count, $groups.Count)
     foreach($g in $groups){
       $item = $g.Group | Select-Object -First 1
       Uninstall-ArpEntry $item.Entry -Force:$ForceUninstallTool
@@ -430,12 +429,10 @@ try{
   if($need.SDK){     Remove-FolderIfBelowMin (Join-Path $root64 "sdk") $minKeepObj }
 
   # Post-check: remaining below-min ARP
-  $after = Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86
-  Write-Log ("Post-check: Below-min (ARP) remaining: {0}" -f $after.Count)
-  if ($after.Count -gt 0) {
-    foreach ($x in ($after | Sort-Object Family,Arch,Version)) {
-      Write-Log ("  Remaining below-min ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
-    }
+  $after = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
+  Write-Log ("Post-check: Below-min (ARP) remaining: {0}" -f @($after).Count)
+  foreach ($x in ($after | Sort-Object Family,Arch,Version)) {
+    Write-Log ("  Remaining below-min ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
   }
 
   Write-Log "Done."
