@@ -17,13 +17,13 @@ Behavior:
 Exit codes:
   0 = no reboot needed; updates installed or none available
   1 = reboot required/pending; prompt launched or scheduled (no forced reboot)
-  2 = report-only OR updates found but none installed under rules
+  2 = report-only OR updates found but none were installed under rules
   3 = error
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-  [ValidateSet('Normal','PostBoot')]
+  [ValidateSet('Normal','PostBoot','PromptOnly')]
   [string]$Mode = 'Normal',
 
   [int]$CountdownMinutes = 10,
@@ -57,15 +57,16 @@ if ($PostponeOptionsCsv) {
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $LogPath) -Force | Out-Null
 
-$StatePath          = Join-Path $BaseDir "WU-State.json"
-$UiHelperPath       = Join-Path $BaseDir "RebootPromptUI.ps1"
-$UiWrapperPath      = Join-Path $BaseDir "RunRebootPrompt.cmd"
-$MainScriptCopyPath = Join-Path $BaseDir "Windows-Update-No-Auto-Reboot.ps1"
+$StatePath           = Join-Path $BaseDir "WU-State.json"
+$UiHelperPath        = Join-Path $BaseDir "RebootPromptUI.ps1"
+$UiWrapperPath       = Join-Path $BaseDir "RunRebootPrompt.cmd"
+$ReminderWrapperPath = Join-Path $BaseDir "RunRebootReminder.cmd"
+$MainScriptCopyPath  = Join-Path $BaseDir "Windows-Update-No-Auto-Reboot.ps1"
 
-$TaskPostBoot       = "Nexus_WU_PostBootWorker"
-$TaskReminder       = "Nexus_WU_RebootReminder"
-$TaskOnLogon        = "Nexus_WU_PromptOnLogon"
-$TaskImmediate      = "Nexus_WU_PromptNow"
+$TaskPostBoot        = "Nexus_WU_PostBootWorker"
+$TaskReminder        = "Nexus_WU_RebootReminder"
+$TaskOnLogon         = "Nexus_WU_PromptOnLogon"
+$TaskImmediate       = "Nexus_WU_PromptNow"
 
 function Write-Log {
   param(
@@ -338,7 +339,6 @@ function Ensure-MainScriptCopy {
   return $MainScriptCopyPath
 }
 
-# ---------- Reliable UI launch as SYSTEM in active session ----------
 $script:LauncherLoaded = $false
 function Ensure-SystemSessionLauncher {
   if ($script:LauncherLoaded) { return $true }
@@ -562,9 +562,11 @@ public static class NexusSessionLauncher
   }
 }
 
-# ---------- UI helper ----------
 function Write-UiHelperScript {
   $optsCsv = ($PostponeOptionsMinutes | ForEach-Object { [int]$_ }) -join ','
+  $mainScriptPathForReminder = $MainScriptCopyPath
+  $reminderWrapperPathForHelper = $ReminderWrapperPath
+  $baseDirForHelper = $BaseDir
 
   $content = @"
 param(
@@ -579,7 +581,16 @@ $Reason
   [string]`$LogPath = @'
 $LogPath
 '@,
-  [string]`$TaskReminder = '$TaskReminder'
+  [string]`$TaskReminder = '$TaskReminder',
+  [string]`$MainScriptPath = @'
+$mainScriptPathForReminder
+'@,
+  [string]`$ReminderWrapperPath = @'
+$reminderWrapperPathForHelper
+'@,
+  [string]`$BaseDir = @'
+$baseDirForHelper
+'@
 )
 
 Set-StrictMode -Off
@@ -618,17 +629,6 @@ function Write-ExceptionLocal {
   }
 }
 
-function Get-CurrentIdentityName {
-  try {
-    return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-  } catch {
-    if (`$env:USERDOMAIN -and `$env:USERNAME) {
-      return ("{0}\{1}" -f `$env:USERDOMAIN, `$env:USERNAME)
-    }
-    return `$env:USERNAME
-  }
-}
-
 function Test-PendingReboot {
   `$paths = @(
     'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
@@ -646,29 +646,60 @@ function Test-PendingReboot {
 }
 
 function Remove-ReminderTask {
+  try { Unregister-ScheduledTask -TaskName `$TaskReminder -Confirm:`$false -ErrorAction SilentlyContinue | Out-Null } catch { }
   try { schtasks.exe /Delete /TN `$TaskReminder /F *> `$null } catch { }
+}
+
+function Write-ReminderTaskDiagnostics {
+  param([string]`$TaskName)
+
+  try {
+    Import-Module ScheduledTasks -ErrorAction Stop
+    `$task = Get-ScheduledTask -TaskName `$TaskName -ErrorAction Stop
+    `$info = Get-ScheduledTaskInfo -TaskName `$TaskName -ErrorAction Stop
+
+    `$actionText = @()
+    foreach (`$a in @(`$task.Actions)) {
+      `$actionText += ("Execute='{0}' Arguments='{1}'" -f `$a.Execute, `$a.Arguments)
+    }
+
+    Write-LogLocal ("UI_REMINDER_TASK: Name='{0}'; State='{1}'; PrincipalUserId='{2}'; LogonType='{3}'; RunLevel='{4}'" -f `
+      `$TaskName, `$task.State, `$task.Principal.UserId, `$task.Principal.LogonType, `$task.Principal.RunLevel) 'DEBUG'
+    Write-LogLocal ("UI_REMINDER_TASK: LastRunTime='{0}'; LastTaskResult='{1}'; NextRunTime='{2}'" -f `
+      `$info.LastRunTime, `$info.LastTaskResult, `$info.NextRunTime) 'DEBUG'
+
+    if (`$actionText.Count -gt 0) {
+      Write-LogLocal ("UI_REMINDER_TASK: Actions={0}" -f (`$actionText -join ' | ')) 'DEBUG'
+    }
+  } catch {
+    Write-ExceptionLocal -Prefix 'UI_REMINDER_TASK_DIAGNOSTICS_ERROR' -ErrorRecord `$_
+  }
 }
 
 function Schedule-Reminder([datetime]`$When) {
   try {
+    Import-Module ScheduledTasks -ErrorAction Stop
+
     `$psExe = "`$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    `$self = "`$PSCommandPath"
-    `$tr = ('"{0}" -NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{1}" -CountdownMinutes {2}' -f `$psExe, `$self, `$CountdownMinutes)
-    `$sd = `$When.ToString('MM/dd/yyyy')
-    `$st = `$When.ToString('HH:mm')
-    `$currentIdentity = Get-CurrentIdentityName
-    `$isSystem = (`$currentIdentity -eq 'NT AUTHORITY\SYSTEM')
+    `$cmdLine = ('"{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -Mode PromptOnly -CountdownMinutes {2} -PostponeOptionsCsv "{3}" -BaseDir "{4}" -LogPath "{5}"' -f `
+      `$psExe, `$MainScriptPath, `$CountdownMinutes, `$PostponeCsv, `$BaseDir, `$LogPath)
+
+    New-Item -ItemType Directory -Path `$BaseDir -Force | Out-Null
+    Set-Content -Path `$ReminderWrapperPath -Value ("@echo off`r`n" + `$cmdLine + "`r`n") -Encoding ASCII -Force
+    Write-LogLocal ("UI: reminder wrapper written to '{0}' with command '{1}'" -f `$ReminderWrapperPath, `$cmdLine) 'DEBUG'
 
     Remove-ReminderTask
 
-    if (`$isSystem) {
-      `$out = & schtasks.exe /Create /TN `$TaskReminder /SC ONCE /SD `$sd /ST `$st /RU SYSTEM /RL HIGHEST /IT /TR `$tr /F 2>&1
-    } else {
-      `$out = & schtasks.exe /Create /TN `$TaskReminder /SC ONCE /SD `$sd /ST `$st /RU `$currentIdentity /RL LIMITED /IT /TR `$tr /F 2>&1
-    }
+    `$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument "/c `"`$ReminderWrapperPath`""
+    `$trigger = New-ScheduledTaskTrigger -Once -At `$When
+    `$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    `$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
-    Write-LogLocal ("UI: reminder schtasks /Create output: {0}" -f ((`$out | ForEach-Object { `$_.ToString().Trim() }) -join ' | ')) 'DEBUG'
-    return (`$LASTEXITCODE -eq 0)
+    Register-ScheduledTask -TaskName `$TaskReminder -Action `$action -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
+
+    Write-LogLocal ("UI: reminder task registered for {0}" -f `$When.ToString('yyyy-MM-dd HH:mm:ss')) 'INFO'
+    Write-ReminderTaskDiagnostics -TaskName `$TaskReminder
+    return `$true
   } catch {
     Write-ExceptionLocal -Prefix 'UI_REMINDER_SCHEDULE_ERROR' -ErrorRecord `$_
     return `$false
@@ -793,7 +824,7 @@ try {
       `$form.Close()
     } else {
       Write-LogLocal ("USER_ACTION: Postpone FAILED ({0} minutes)" -f `$mins) 'ERROR'
-      `$label3.Text = 'Postpone failed (could not schedule reminder).'
+      `$label3.Text = 'Postpone failed (could not schedule reminder). Please try again or choose Reboot now.'
     }
   })
   `$form.Controls.Add(`$btnPostpone)
@@ -836,7 +867,6 @@ function Write-UiWrapperFile {
   Write-Log ("Wrote UI wrapper file to '{0}'." -f $UiWrapperPath) 'DEBUG'
 }
 
-# ---------- Immediate UI launch using proven logic ----------
 function Launch-UiInActiveSessionNow {
   if (-not (Test-PendingReboot)) {
     Write-Log "Immediate UI not launched: reboot not required."
@@ -910,7 +940,6 @@ function Launch-UiInActiveSessionNow {
   Write-Log "Immediate UI final fallback was msg.exe only (no reboot)." 'WARN'
 }
 
-# ---------- ONLOGON task ----------
 function Register-LogonPromptTask {
   Remove-Task $TaskOnLogon
   Write-UiWrapperFile
@@ -938,7 +967,6 @@ function Register-LogonPromptTask {
   Write-TaskDiagnostics -TaskName $TaskOnLogon -Prefix 'ONLOGON_TASK'
 }
 
-# ---------- Windows Update COM scan/install ----------
 function Get-AvailableUpdates {
   $session  = New-Object -ComObject Microsoft.Update.Session
   $searcher = $session.CreateUpdateSearcher()
@@ -1105,7 +1133,6 @@ function Run-WindowsUpdatePasses {
   }
 }
 
-# ---------- Post-boot worker ----------
 function Register-PostBootWorkerTask {
   try { Import-Module ScheduledTasks -ErrorAction Stop } catch { throw "ScheduledTasks module is required." }
 
@@ -1182,7 +1209,6 @@ function Run-PostBootWorker {
   Write-Log "POSTBOOT: Worker task removed."
 }
 
-# ---------- MAIN ----------
 try {
   Ensure-BaseDirPermissions
 
@@ -1198,14 +1224,25 @@ try {
   }
 
   Abort-AnyShutdown
+  Ensure-MainScriptCopy | Out-Null
   Write-UiHelperScript
+
+  if ($Mode -eq 'PromptOnly') {
+    Write-Log "PromptOnly mode: checking reboot state and relaunching UI if needed."
+    if (Test-PendingReboot) {
+      Launch-UiInActiveSessionNow
+      exit 1
+    } else {
+      Write-Log "PromptOnly mode: reboot not required; nothing to show."
+      Remove-Task $TaskReminder
+      exit 0
+    }
+  }
 
   if ($Mode -eq 'PostBoot') {
     Run-PostBootWorker
     exit 0
   }
-
-  Ensure-MainScriptCopy | Out-Null
 
   if ($ReportOnly) {
     Write-Log "ReportOnly=True. Scan-only mode; no installs will be attempted."
