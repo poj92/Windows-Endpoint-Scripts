@@ -57,16 +57,15 @@ if ($PostponeOptionsCsv) {
 New-Item -ItemType Directory -Path $BaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path (Split-Path -Parent $LogPath) -Force | Out-Null
 
-$StatePath           = Join-Path $BaseDir "WU-State.json"
-$UiHelperPath        = Join-Path $BaseDir "RebootPromptUI.ps1"
-$UiWrapperPath       = Join-Path $BaseDir "RunRebootPrompt.cmd"
-$ReminderWrapperPath = Join-Path $BaseDir "RunRebootReminder.cmd"
-$MainScriptCopyPath  = Join-Path $BaseDir "Windows-Update-No-Auto-Reboot.ps1"
+$StatePath          = Join-Path $BaseDir "WU-State.json"
+$UiHelperPath       = Join-Path $BaseDir "RebootPromptUI.ps1"
+$UiWrapperPath      = Join-Path $BaseDir "RunRebootPrompt.cmd"
+$MainScriptCopyPath = Join-Path $BaseDir "Windows-Update-No-Auto-Reboot.ps1"
 
-$TaskPostBoot        = "Nexus_WU_PostBootWorker"
-$TaskReminder        = "Nexus_WU_RebootReminder"
-$TaskOnLogon         = "Nexus_WU_PromptOnLogon"
-$TaskImmediate       = "Nexus_WU_PromptNow"
+$TaskPostBoot       = "Nexus_WU_PostBootWorker"
+$TaskReminder       = "Nexus_WU_RebootReminder"
+$TaskOnLogon        = "Nexus_WU_PromptOnLogon"
+$TaskImmediate      = "Nexus_WU_PromptNow"
 
 function Write-Log {
   param(
@@ -565,7 +564,6 @@ public static class NexusSessionLauncher
 function Write-UiHelperScript {
   $optsCsv = ($PostponeOptionsMinutes | ForEach-Object { [int]$_ }) -join ','
   $mainScriptPathForReminder = $MainScriptCopyPath
-  $reminderWrapperPathForHelper = $ReminderWrapperPath
   $baseDirForHelper = $BaseDir
 
   $content = @"
@@ -584,9 +582,6 @@ $LogPath
   [string]`$TaskReminder = '$TaskReminder',
   [string]`$MainScriptPath = @'
 $mainScriptPathForReminder
-'@,
-  [string]`$ReminderWrapperPath = @'
-$reminderWrapperPathForHelper
 '@,
   [string]`$BaseDir = @'
 $baseDirForHelper
@@ -626,6 +621,17 @@ function Write-ExceptionLocal {
 
   if (`$ErrorRecord.InvocationInfo -and `$ErrorRecord.InvocationInfo.PositionMessage) {
     Write-LogLocal ("{0}: Location={1}" -f `$Prefix, (`$ErrorRecord.InvocationInfo.PositionMessage -replace "`r|`n",' ')) 'DEBUG'
+  }
+}
+
+function Get-CurrentIdentityName {
+  try {
+    return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+  } catch {
+    if (`$env:USERDOMAIN -and `$env:USERNAME) {
+      return ("{0}\{1}" -f `$env:USERDOMAIN, `$env:USERNAME)
+    }
+    return `$env:USERNAME
   }
 }
 
@@ -681,18 +687,24 @@ function Schedule-Reminder([datetime]`$When) {
     Import-Module ScheduledTasks -ErrorAction Stop
 
     `$psExe = "`$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    `$cmdLine = ('"{0}" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{1}" -Mode PromptOnly -CountdownMinutes {2} -PostponeOptionsCsv "{3}" -BaseDir "{4}" -LogPath "{5}"' -f `
-      `$psExe, `$MainScriptPath, `$CountdownMinutes, `$PostponeCsv, `$BaseDir, `$LogPath)
+    `$arg = ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}" -Mode PromptOnly -CountdownMinutes {1} -PostponeOptionsCsv "{2}" -BaseDir "{3}" -LogPath "{4}"' -f `
+      `$MainScriptPath, `$CountdownMinutes, `$PostponeCsv, `$BaseDir, `$LogPath)
 
-    New-Item -ItemType Directory -Path `$BaseDir -Force | Out-Null
-    Set-Content -Path `$ReminderWrapperPath -Value ("@echo off`r`n" + `$cmdLine + "`r`n") -Encoding ASCII -Force
-    Write-LogLocal ("UI: reminder wrapper written to '{0}' with command '{1}'" -f `$ReminderWrapperPath, `$cmdLine) 'DEBUG'
+    Write-LogLocal ("UI: reminder action will run: {0} {1}" -f `$psExe, `$arg) 'DEBUG'
 
     Remove-ReminderTask
 
-    `$action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\cmd.exe" -Argument "/c `"`$ReminderWrapperPath`""
+    `$currentIdentity = Get-CurrentIdentityName
+    `$isSystem = (`$currentIdentity -eq 'NT AUTHORITY\SYSTEM')
+
+    if (`$isSystem) {
+      `$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    } else {
+      `$principal = New-ScheduledTaskPrincipal -UserId `$currentIdentity -LogonType Interactive -RunLevel Limited
+    }
+
+    `$action = New-ScheduledTaskAction -Execute `$psExe -Argument `$arg
     `$trigger = New-ScheduledTaskTrigger -Once -At `$When
-    `$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     `$settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
     Register-ScheduledTask -TaskName `$TaskReminder -Action `$action -Trigger `$trigger -Principal `$principal -Settings `$settings -Force | Out-Null
