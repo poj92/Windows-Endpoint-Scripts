@@ -19,7 +19,6 @@ Datto Variables:
     WorkingDirectory = C:\ProgramData\DattoRMM\Packages\DellDDPM
 #>
 
-
 param(
     [ValidateSet("Detect","Remediate")]
     [string]$Mode = "Remediate",
@@ -47,8 +46,12 @@ param(
 # 2 = fatal script error
 # 3 = skipped non-Dell device
 # 4 = below-minimum software found, but uninstall verification failed; install not attempted
+# 5 = older version removed successfully, but DDPM package metadata missing
+# 6 = DDPM downloaded/installed, but not detected afterwards
 
 $script:StartTime = Get-Date
+$script:LatestDDPM = $null
+$script:LatestDDPMFileNameResolved = $null
 
 function Write-Log {
     param(
@@ -75,41 +78,103 @@ function Write-Log {
     }
 }
 
-function Require-RemediationPackageMetadata {
-    if ([string]::IsNullOrWhiteSpace($LatestDDPMUrl)) {
-        throw "LatestDDPMUrl is required in Remediate mode."
-    }
-    if ([string]::IsNullOrWhiteSpace($LatestDDPMVersion)) {
-        throw "LatestDDPMVersion is required in Remediate mode."
-    }
-    if ([string]::IsNullOrWhiteSpace($LatestDDPMSha256)) {
-        throw "LatestDDPMSha256 is required in Remediate mode."
+function Resolve-InputValue {
+    param(
+        [string]$CurrentValue,
+        [string]$EnvName
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($CurrentValue)) {
+        return $CurrentValue.Trim()
     }
 
-    if ([string]::IsNullOrWhiteSpace($LatestDDPMFileName)) {
-        try {
-            $script:LatestDDPMFileNameResolved = [System.IO.Path]::GetFileName(([System.Uri]$LatestDDPMUrl).AbsolutePath)
-        }
-        catch {
-            throw "LatestDDPMFileName was blank and could not be derived from LatestDDPMUrl."
+    try {
+        $envValue = [Environment]::GetEnvironmentVariable($EnvName)
+        if (-not [string]::IsNullOrWhiteSpace($envValue)) {
+            return $envValue.Trim()
         }
     }
-    else {
-        $script:LatestDDPMFileNameResolved = $LatestDDPMFileName
+    catch {}
+
+    return ""
+}
+
+function Try-DeriveVersionFromText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return ""
+    }
+
+    $m = [regex]::Match($Text, '\d+(\.\d+){1,3}')
+    if ($m.Success) {
+        return $m.Value
+    }
+
+    return ""
+}
+
+function Resolve-RemediationInputs {
+    $script:ResolvedLatestDDPMUrl        = Resolve-InputValue -CurrentValue $LatestDDPMUrl        -EnvName "LatestDDPMUrl"
+    $script:ResolvedLatestDDPMVersion    = Resolve-InputValue -CurrentValue $LatestDDPMVersion    -EnvName "LatestDDPMVersion"
+    $script:ResolvedLatestDDPMSha256     = Resolve-InputValue -CurrentValue $LatestDDPMSha256     -EnvName "LatestDDPMSha256"
+    $script:ResolvedLatestDDPMFileName   = Resolve-InputValue -CurrentValue $LatestDDPMFileName   -EnvName "LatestDDPMFileName"
+    $script:ResolvedLatestDDPMSilentArgs = Resolve-InputValue -CurrentValue $LatestDDPMSilentArgs -EnvName "LatestDDPMSilentArgs"
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMSilentArgs)) {
+        $script:ResolvedLatestDDPMSilentArgs = "/S"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMFileName) -and
+        -not [string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMUrl)) {
+        try {
+            $script:ResolvedLatestDDPMFileName = [System.IO.Path]::GetFileName(([System.Uri]$script:ResolvedLatestDDPMUrl).AbsolutePath)
+        }
+        catch {}
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMVersion)) {
+        $script:ResolvedLatestDDPMVersion = Try-DeriveVersionFromText -Text $script:ResolvedLatestDDPMFileName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMVersion)) {
+        $script:ResolvedLatestDDPMVersion = Try-DeriveVersionFromText -Text $script:ResolvedLatestDDPMUrl
+    }
+
+    Write-Log ("Resolved LatestDDPMUrl supplied: {0}" -f (-not [string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMUrl)))
+    Write-Log ("Resolved LatestDDPMVersion supplied/derived: {0}" -f (-not [string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMVersion)))
+    Write-Log ("Resolved LatestDDPMSha256 supplied: {0}" -f (-not [string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMSha256)))
+    Write-Log ("Resolved LatestDDPMFileName supplied/derived: {0}" -f (-not [string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMFileName)))
+    Write-Log ("Resolved LatestDDPMSilentArgs: {0}" -f $script:ResolvedLatestDDPMSilentArgs)
+}
+
+function Require-RemediationPackageMetadata {
+    Resolve-RemediationInputs
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMUrl)) {
+        throw "LatestDDPMUrl is required when installation is needed."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMSha256)) {
+        throw "LatestDDPMSha256 is required when installation is needed."
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:ResolvedLatestDDPMFileName)) {
+        throw "LatestDDPMFileName was blank and could not be derived from LatestDDPMUrl."
     }
 
     $script:LatestDDPM = [pscustomobject]@{
-        Version            = $LatestDDPMVersion
-        FileName           = $script:LatestDDPMFileNameResolved
-        Url                = $LatestDDPMUrl
-        Sha256             = $LatestDDPMSha256.ToLowerInvariant()
-        SilentArgs         = $LatestDDPMSilentArgs
+        Version            = $script:ResolvedLatestDDPMVersion
+        FileName           = $script:ResolvedLatestDDPMFileName
+        Url                = $script:ResolvedLatestDDPMUrl
+        Sha256             = $script:ResolvedLatestDDPMSha256.ToLowerInvariant()
+        SilentArgs         = $script:ResolvedLatestDDPMSilentArgs
         ProductDisplayName = "Dell Display and Peripheral Manager"
     }
 
-    Write-Log "Target DDPM package version: $($script:LatestDDPM.Version)"
-    Write-Log "Target DDPM URL: $($script:LatestDDPM.Url)"
-    Write-Log "Target DDPM file name: $($script:LatestDDPM.FileName)"
+    Write-Log ("Target DDPM package version: {0}" -f $(if ($script:LatestDDPM.Version) { $script:LatestDDPM.Version } else { "Not specified" }))
+    Write-Log ("Target DDPM URL: {0}" -f $script:LatestDDPM.Url)
+    Write-Log ("Target DDPM file name: {0}" -f $script:LatestDDPM.FileName)
 }
 
 function Test-IsDellDevice {
@@ -121,9 +186,9 @@ function Test-IsDellDevice {
         $model = [string]$cs.Model
         $serial = if ($bios) { [string]$bios.SerialNumber } else { "" }
 
-        Write-Log "Manufacturer: $manufacturer"
-        Write-Log "Model: $model"
-        if ($serial) { Write-Log "Serial: $serial" }
+        Write-Log ("Manufacturer: {0}" -f $manufacturer)
+        Write-Log ("Model: {0}" -f $model)
+        if ($serial) { Write-Log ("Serial: {0}" -f $serial) }
 
         return ($manufacturer -match "Dell")
     }
@@ -176,7 +241,7 @@ function Test-VersionLessThan {
     $vb = Convert-ToVersionObject -Version $VersionB
 
     if (-not $va -or -not $vb) {
-        Write-Log "Version compare failed: '$VersionA' vs '$VersionB'. Treating as below minimum." "WARN"
+        Write-Log ("Version compare failed: '{0}' vs '{1}'. Treating as below minimum." -f $VersionA, $VersionB) "WARN"
         return $true
     }
 
@@ -274,15 +339,90 @@ function Stop-DellProcesses {
         foreach ($p in $patterns) {
             if ($proc.ProcessName -like "*$p*") {
                 try {
-                    Write-Log "Stopping process $($proc.ProcessName) PID $($proc.Id)"
+                    Write-Log ("Stopping process {0} PID {1}" -f $proc.ProcessName, $proc.Id)
                     Stop-Process -Id $proc.Id -Force -ErrorAction Stop
                 }
                 catch {
-                    Write-Log "Unable to stop process $($proc.ProcessName): $($_.Exception.Message)" "WARN"
+                    Write-Log ("Unable to stop process {0}: {1}" -f $proc.ProcessName, $_.Exception.Message) "WARN"
                 }
                 break
             }
         }
+    }
+}
+
+function Remove-RegistryEntryForApp {
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject]$App
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($App.RegistryPath)) {
+        try {
+            Write-Log ("Removing stale uninstall registry entry: {0}" -f $App.RegistryPath) "WARN"
+            Remove-Item -Path $App.RegistryPath -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            Write-Log ("Failed to remove registry path {0}: {1}" -f $App.RegistryPath, $_.Exception.Message) "WARN"
+        }
+    }
+
+    throw "Unable to remove stale uninstall registry entry for $($App.DisplayName)"
+}
+
+function Split-CommandToExecutableAndArgs {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Command
+    )
+
+    $trimmed = $Command.Trim()
+
+    if ($trimmed -match '^(?i)"?msiexec(\.exe)?"?\b') {
+        return [pscustomobject]@{
+            Executable = "msiexec.exe"
+            Arguments  = ($trimmed -replace '^(?i)"?msiexec(\.exe)?"?\s*', '')
+            IsMSI      = $true
+        }
+    }
+
+    if ($trimmed.StartsWith('"')) {
+        $parts = $trimmed -split '"', 3
+        return [pscustomobject]@{
+            Executable = $parts[1]
+            Arguments  = $(if ($parts.Count -ge 3) { $parts[2].Trim() } else { "" })
+            IsMSI      = $false
+        }
+    }
+
+    if (Test-Path -LiteralPath $trimmed) {
+        return [pscustomobject]@{
+            Executable = $trimmed
+            Arguments  = ""
+            IsMSI      = $false
+        }
+    }
+
+    $matches = [regex]::Matches($trimmed, '\.exe', 'IgnoreCase')
+    for ($m = $matches.Count - 1; $m -ge 0; $m--) {
+        $exeEnd = $matches[$m].Index + $matches[$m].Length
+        $possibleExe = $trimmed.Substring(0, $exeEnd).Trim('"',' ')
+        $possibleArgs = $trimmed.Substring($exeEnd).Trim()
+
+        if (Test-Path -LiteralPath $possibleExe) {
+            return [pscustomobject]@{
+                Executable = $possibleExe
+                Arguments  = $possibleArgs
+                IsMSI      = $false
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Executable = $null
+        Arguments  = $null
+        IsMSI      = $false
     }
 }
 
@@ -293,58 +433,39 @@ function Invoke-UninstallCommand {
     )
 
     $trimmed = $Command.Trim()
-    Write-Log "Original uninstall command: $trimmed"
+    Write-Log ("Original uninstall command: {0}" -f $trimmed)
 
-    if ($trimmed -match '(?i)msiexec(\.exe)?\s') {
+    $parsed = Split-CommandToExecutableAndArgs -Command $trimmed
+
+    if ($parsed.IsMSI) {
         $guidMatch = [regex]::Match($trimmed, '\{[A-Z0-9\-]+\}', 'IgnoreCase')
         if ($guidMatch.Success) {
             $guid = $guidMatch.Value
             $args = "/x $guid /qn /norestart"
-            Write-Log "Executing MSI uninstall: msiexec.exe $args"
-            $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
-            return $p.ExitCode
         }
         else {
-            $args = $trimmed -replace '^(?i)"?msiexec(\.exe)?"?\s*', ''
+            $args = $parsed.Arguments
             if ($args -notmatch '(/quiet|/qn|/passive)') {
                 $args += " /qn /norestart"
             }
-            Write-Log "Executing MSI uninstall with args: msiexec.exe $args"
-            $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
-            return $p.ExitCode
         }
+
+        Write-Log ("Executing MSI uninstall: msiexec.exe {0}" -f $args)
+        $p = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+        return $p.ExitCode
     }
 
-    $exe = $null
-    $args = $null
-
-    if ($trimmed.StartsWith('"')) {
-        $parts = $trimmed -split '"', 3
-        $exe = $parts[1]
-        $args = if ($parts.Count -ge 3) { $parts[2].Trim() } else { "" }
-    }
-    else {
-        $space = $trimmed.IndexOf(" ")
-        if ($space -gt 0) {
-            $exe = $trimmed.Substring(0, $space)
-            $args = $trimmed.Substring($space + 1).Trim()
-        }
-        else {
-            $exe = $trimmed
-            $args = ""
-        }
+    if (-not $parsed.Executable) {
+        throw "Could not parse uninstall command into a valid executable path: $Command"
     }
 
-    if (-not $exe) {
-        throw "Could not parse uninstall command: $Command"
-    }
-
+    $args = $parsed.Arguments
     if ($args -notmatch '(/quiet|/qn|/passive|/s|/silent|/verysilent)') {
         $args = "$args /S".Trim()
     }
 
-    Write-Log "Executing EXE uninstall: $exe $args"
-    $p = Start-Process -FilePath $exe -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
+    Write-Log ("Executing EXE uninstall: {0} {1}" -f $parsed.Executable, $args)
+    $p = Start-Process -FilePath $parsed.Executable -ArgumentList $args -Wait -PassThru -WindowStyle Hidden
     return $p.ExitCode
 }
 
@@ -354,22 +475,56 @@ function Uninstall-App {
         [pscustomobject]$App
     )
 
-    Write-Log "Uninstalling $($App.DisplayName) version '$($App.DisplayVersion)'"
+    Write-Log ("Uninstalling {0} version '{1}'" -f $App.DisplayName, $App.DisplayVersion)
 
     $cmd = if ($App.QuietUninstallString) { $App.QuietUninstallString } else { $App.UninstallString }
     if (-not $cmd) {
-        throw "No uninstall command found for $($App.DisplayName)"
+        Write-Log ("No uninstall command found for {0}. Treating as stale entry and removing registry entry." -f $App.DisplayName) "WARN"
+        Remove-RegistryEntryForApp -App $App
+        return
+    }
+
+    $parsed = Split-CommandToExecutableAndArgs -Command $cmd
+
+    if (-not $parsed.IsMSI) {
+        if (-not $parsed.Executable -or -not (Test-Path -LiteralPath $parsed.Executable)) {
+            Write-Log ("Uninstall target not found on disk: {0}" -f $(if ($parsed.Executable) { $parsed.Executable } else { "Unresolved path" })) "WARN"
+            Write-Log ("Treating {0} as stale uninstall entry and removing registry entry." -f $App.DisplayName) "WARN"
+            Remove-RegistryEntryForApp -App $App
+            return
+        }
     }
 
     Stop-DellProcesses
     $exitCode = Invoke-UninstallCommand -Command $cmd
-    Write-Log "Uninstall exit code: $exitCode"
+    Write-Log ("Uninstall exit code: {0}" -f $exitCode)
 
     if ($exitCode -notin 0,1605,1614,1641,3010) {
         throw "Unexpected uninstall exit code $exitCode for $($App.DisplayName)"
     }
 
     Start-Sleep -Seconds 5
+}
+
+function Clear-PathAttributes {
+    param([string]$TargetPath)
+
+    try {
+        Get-ChildItem -LiteralPath $TargetPath -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            try {
+                $_.Attributes = 'Normal'
+            }
+            catch {}
+        }
+
+        if (Test-Path -LiteralPath $TargetPath) {
+            $item = Get-Item -LiteralPath $TargetPath -Force -ErrorAction SilentlyContinue
+            if ($item) {
+                try { $item.Attributes = 'Directory' } catch {}
+            }
+        }
+    }
+    catch {}
 }
 
 function Remove-StaleAppDirectories {
@@ -385,11 +540,12 @@ function Remove-StaleAppDirectories {
     foreach ($path in $paths) {
         if (Test-Path -LiteralPath $path) {
             try {
-                Write-Log "Removing stale directory: $path"
+                Write-Log ("Removing stale directory: {0}" -f $path)
+                Clear-PathAttributes -TargetPath $path
                 Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction Stop
             }
             catch {
-                Write-Log "Could not remove stale directory $path: $($_.Exception.Message)" "WARN"
+                Write-Log ("Could not remove stale directory {0}: {1}" -f $path, $_.Exception.Message) "WARN"
             }
         }
     }
@@ -414,7 +570,7 @@ function Download-LatestDDPM {
             [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         }
         catch {
-            Write-Log "Could not force TLS 1.2: $($_.Exception.Message)" "WARN"
+            Write-Log ("Could not force TLS 1.2: {0}" -f $_.Exception.Message) "WARN"
         }
     }
 
@@ -424,7 +580,7 @@ function Download-LatestDDPM {
         try {
             $existingHash = Get-FileSha256 -Path $destination
             if ($existingHash -eq $script:LatestDDPM.Sha256) {
-                Write-Log "Installer already present and checksum matches: $destination"
+                Write-Log ("Installer already present and checksum matches: {0}" -f $destination)
                 return $destination
             }
 
@@ -432,14 +588,14 @@ function Download-LatestDDPM {
             Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
         }
         catch {
-            Write-Log "Failed to validate existing installer: $($_.Exception.Message)" "WARN"
+            Write-Log ("Failed to validate existing installer: {0}" -f $_.Exception.Message) "WARN"
             Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
         }
     }
 
     Write-Log "Downloading DDPM package"
-    Write-Log "Source: $($script:LatestDDPM.Url)"
-    Write-Log "Destination: $destination"
+    Write-Log ("Source: {0}" -f $script:LatestDDPM.Url)
+    Write-Log ("Destination: {0}" -f $destination)
 
     $ProgressPreference = 'SilentlyContinue'
 
@@ -457,7 +613,7 @@ function Download-LatestDDPM {
     }
 
     $hash = Get-FileSha256 -Path $destination
-    Write-Log "Downloaded file SHA256: $hash"
+    Write-Log ("Downloaded file SHA256: {0}" -f $hash)
 
     if ($hash -ne $script:LatestDDPM.Sha256) {
         Remove-Item -LiteralPath $destination -Force -ErrorAction SilentlyContinue
@@ -474,17 +630,17 @@ function Install-DDPM {
         [string]$InstallerPath
     )
 
-    Write-Log "Installing DDPM from $InstallerPath"
-    Write-Log "Silent arguments: $($script:LatestDDPM.SilentArgs)"
+    Write-Log ("Installing DDPM from {0}" -f $InstallerPath)
+    Write-Log ("Silent arguments: {0}" -f $script:LatestDDPM.SilentArgs)
 
     $p = Start-Process -FilePath $InstallerPath -ArgumentList $script:LatestDDPM.SilentArgs -Wait -PassThru -WindowStyle Hidden
-    Write-Log "Installer exit code: $($p.ExitCode)"
+    Write-Log ("Installer exit code: {0}" -f $p.ExitCode)
 
     if ($p.ExitCode -notin 0,1641,3010) {
         throw "DDPM installer returned unexpected exit code $($p.ExitCode)"
     }
 
-    Start-Sleep -Seconds 15
+    Start-Sleep -Seconds 20
 }
 
 function Get-DDPMAfterInstall {
@@ -522,18 +678,22 @@ function Assert-TargetDDPMDetected {
         throw "DDPM install completed but DDPM was not detected afterwards."
     }
 
-    Write-Log "Installed DDPM detected: $($installed.DisplayVersion)"
+    Write-Log ("Installed DDPM detected: {0}" -f $installed.DisplayVersion)
 
     if (Test-VersionLessThan -VersionA $installed.DisplayVersion -VersionB $MinimumSafeVersion) {
         throw "Installed DDPM version '$($installed.DisplayVersion)' is still below minimum '$MinimumSafeVersion'."
     }
+
+    if (-not [string]::IsNullOrWhiteSpace($script:LatestDDPM.Version)) {
+        Write-Log ("Expected DDPM version (advisory only): {0}" -f $script:LatestDDPM.Version)
+    }
 }
 
 Write-Log "========== Dell DPM/DDPM compliance script =========="
-Write-Log "Mode: $Mode"
-Write-Log "MinimumSafeVersion: $MinimumSafeVersion"
-Write-Log "SkipNonDell: $SkipNonDell"
-Write-Log "WorkingDirectory: $WorkingDirectory"
+Write-Log ("Mode: {0}" -f $Mode)
+Write-Log ("MinimumSafeVersion: {0}" -f $MinimumSafeVersion)
+Write-Log ("SkipNonDell: {0}" -f $SkipNonDell)
+Write-Log ("WorkingDirectory: {0}" -f $WorkingDirectory)
 
 try {
     if ($SkipNonDell -and -not (Test-IsDellDevice)) {
@@ -549,7 +709,7 @@ try {
     else {
         foreach ($app in $initial.Apps) {
             $status = if ($initial.BelowMinimumApps -contains $app) { "BELOW-MINIMUM" } else { "OK" }
-            Write-Log "$status :: $($app.DisplayName) :: Version=$($app.DisplayVersion) :: Normalized=$($app.NormalizedVersion)"
+            Write-Log ("{0} :: {1} :: Version={2} :: Normalized={3}" -f $status, $app.DisplayName, $app.DisplayVersion, $app.NormalizedVersion)
         }
     }
 
@@ -563,8 +723,6 @@ try {
             exit 0
         }
     }
-
-    Require-RemediationPackageMetadata
 
     if ($initial.BelowMinimumApps.Count -eq 0) {
         Write-Log "No below-minimum DPM/DDPM found. No remediation required, and DDPM install will not be attempted." "SUCCESS"
@@ -595,16 +753,33 @@ try {
         exit 0
     }
 
+    try {
+        Require-RemediationPackageMetadata
+    }
+    catch {
+        Write-Log "Older version was removed successfully, but DDPM package metadata is missing or invalid." "ERROR"
+        Write-Log $_.Exception.Message "ERROR"
+        exit 5
+    }
+
     $installer = Download-LatestDDPM
     Install-DDPM -InstallerPath $installer
-    Assert-TargetDDPMDetected
+
+    try {
+        Assert-TargetDDPMDetected
+    }
+    catch {
+        Write-Log $_.Exception.Message "ERROR"
+        exit 6
+    }
+
     Assert-NoBelowMinimumRemains
 
     Write-Log "Remediation result: COMPLIANT" "SUCCESS"
     exit 0
 }
 catch {
-    Write-Log "Fatal error: $($_.Exception.Message)" "ERROR"
+    Write-Log ("Fatal error: {0}" -f $_.Exception.Message) "ERROR"
     exit 2
 }
 finally {
