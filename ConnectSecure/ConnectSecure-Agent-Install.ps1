@@ -19,4 +19,4 @@ if (-not $env:CompanyID -or -not $env:TenantID -or -not $env:Secret) {
     throw "Missing Datto RMM variable: CompanyID, TenantID, or Secret."
 }
 
-.\cybercnsagent.exe -c "$env:CompanyID" -e "$env:TenantID" -j "$env:Secret" -i
+.\cybercnsagent.exe -c $env:CompanyID -e $env:TenantID -j $env:Secret -i
