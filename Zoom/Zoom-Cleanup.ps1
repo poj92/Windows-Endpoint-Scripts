@@ -218,15 +218,26 @@ function Run-Command {
     $psi.Arguments = "/c $Command"
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
 
     $proc = New-Object System.Diagnostics.Process
     $proc.StartInfo = $psi
     $null = $proc.Start()
 
+    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
+    $stderrTask = $proc.StandardError.ReadToEndAsync()
+
     if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
         try { & taskkill.exe /PID $proc.Id /T /F *> $null } catch {}
         throw "Timed out after $TimeoutSec seconds"
     }
+
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+
+    if (-not [string]::IsNullOrWhiteSpace($stdout)) { Log "STDOUT: $($stdout.Trim())" }
+    if (-not [string]::IsNullOrWhiteSpace($stderr)) { Log "STDERR: $($stderr.Trim())" }
 
     return $proc.ExitCode
 }
@@ -263,12 +274,127 @@ function Remove-RegKeySafe {
     }
 }
 
+function Get-UserProfiles {
+    $systemSids     = @('S-1-5-18', 'S-1-5-19', 'S-1-5-20')
+    $profileListKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList'
+    $profiles       = @()
+
+    foreach ($key in Get-ChildItem $profileListKey -ErrorAction SilentlyContinue) {
+        $sid = $key.PSChildName
+        if ($sid -in $systemSids) { continue }
+        if ($sid -notmatch '^S-1-5-21-') { continue }
+
+        try {
+            $props = Get-ItemProperty $key.PSPath -ErrorAction Stop
+            $path  = $props.ProfileImagePath
+            if ($path -and (Test-Path -LiteralPath $path)) {
+                $profiles += [pscustomobject]@{
+                    SID         = $sid
+                    ProfilePath = $path
+                }
+            }
+        } catch {}
+    }
+
+    return $profiles
+}
+
+function Get-PerUserZoomInstalls {
+    $installs = @()
+
+    foreach ($profile in @(Get-UserProfiles)) {
+        $profilePath = $profile.ProfilePath
+
+        foreach ($relBin in @('AppData\Roaming\Zoom\bin\Zoom.exe', 'AppData\Local\Zoom\bin\Zoom.exe')) {
+            $zoomExe = Join-Path $profilePath $relBin
+            if (-not (Test-Path -LiteralPath $zoomExe)) { continue }
+
+            $fileVer = try {
+                (Get-Item -LiteralPath $zoomExe -ErrorAction Stop).VersionInfo.FileVersion
+            } catch { $null }
+
+            $version  = To-Version $fileVer
+            $zoomRoot = Split-Path (Split-Path $zoomExe -Parent) -Parent
+
+            $uninstallExe = Join-Path $zoomRoot 'uninstall\Installer.exe'
+            if (-not (Test-Path -LiteralPath $uninstallExe)) { $uninstallExe = $null }
+
+            $installs += [pscustomobject]@{
+                SID            = $profile.SID
+                ProfilePath    = $profilePath
+                ZoomRoot       = $zoomRoot
+                ZoomExe        = $zoomExe
+                DisplayVersion = $fileVer
+                Version        = $version
+                InstallerPath  = $uninstallExe
+                DisplayName    = "Zoom (per-user: $(Split-Path $profilePath -Leaf))"
+            }
+            break
+        }
+    }
+
+    return $installs
+}
+
+function Remove-PerUserZoomRegistry {
+    param(
+        [string]$SID,
+        [string]$ProfilePath
+    )
+
+    # If the user's hive is already loaded (user currently logged in), use it directly
+    $loadedHivePath = "Registry::HKEY_USERS\$SID"
+    if (Test-Path $loadedHivePath) {
+        $uninstallPath = "$loadedHivePath\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        if (Test-Path $uninstallPath) {
+            foreach ($sub in Get-ChildItem $uninstallPath -ErrorAction SilentlyContinue) {
+                try {
+                    $props = Get-ItemProperty $sub.PSPath -ErrorAction Stop
+                    if (Test-IsZoomDesktopName $props.DisplayName) {
+                        Remove-RegKeySafe -KeyPath $sub.PSPath -Why 'per-user Zoom HKCU cleanup'
+                    }
+                } catch {}
+            }
+        }
+        return
+    }
+
+    # User is not logged in; temporarily load the offline hive
+    $hivePath = Join-Path $ProfilePath 'NTUSER.DAT'
+    if (-not (Test-Path -LiteralPath $hivePath)) { return }
+
+    $mountKey = "ZoomClean_$($SID -replace '[^A-Za-z0-9]', '_')"
+    try {
+        $null = & reg.exe load "HKU\$mountKey" $hivePath 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Add-Action "Skipped HKCU registry cleanup for $ProfilePath (hive could not be loaded)"
+            return
+        }
+
+        $uninstallPath = "Registry::HKEY_USERS\$mountKey\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+        if (Test-Path $uninstallPath) {
+            foreach ($sub in Get-ChildItem $uninstallPath -ErrorAction SilentlyContinue) {
+                try {
+                    $props = Get-ItemProperty $sub.PSPath -ErrorAction Stop
+                    if (Test-IsZoomDesktopName $props.DisplayName) {
+                        Remove-RegKeySafe -KeyPath $sub.PSPath -Why 'per-user Zoom HKCU cleanup'
+                    }
+                } catch {}
+            }
+        }
+    } finally {
+        [GC]::Collect()
+        [GC]::WaitForPendingFinalizers()
+        $null = & reg.exe unload "HKU\$mountKey" 2>&1
+    }
+}
+
 try {
-    $reportOnly = To-Bool $ReportOnly $true
-    $stopZoom = To-Bool $StopZoomProcesses $true
+    $reportOnly       = To-Bool $ReportOnly $true
+    $stopZoom         = To-Bool $StopZoomProcesses $true
     $cleanupResiduals = To-Bool $CleanupResiduals $true
-    $timeout = [int]$OperationTimeoutSec
-    $minVersion = To-Version $MinimumVersionToKeep
+    $timeout          = [int]$OperationTimeoutSec
+    $minVersion       = To-Version $MinimumVersionToKeep
 
     if (-not $minVersion) {
         Out-Result -Status 'Failed' -Summary "Invalid MinimumVersionToKeep [$MinimumVersionToKeep]" -ExitCode 1
@@ -277,29 +403,35 @@ try {
     Add-Action "Starting Zoom version check"
     Add-Action "Settings: MinimumVersionToKeep=$minVersion ReportOnly=$reportOnly CleanupResiduals=$cleanupResiduals TimeoutSec=$timeout"
 
-    $entries = @(Get-ZoomEntries)
+    $entries      = @(Get-ZoomEntries)
+    $perUserItems = @(Get-PerUserZoomInstalls)
 
-    if (-not $entries.Count) {
-        Add-Action "No Zoom desktop uninstall entries found"
-        Out-Result -Status 'OK' -Summary 'No Zoom desktop entries found. Nothing to do.' -ExitCode 0
+    if (-not $entries.Count -and -not $perUserItems.Count) {
+        Add-Action "No Zoom desktop uninstall entries or per-user installs found"
+        Out-Result -Status 'OK' -Summary 'No Zoom found. Nothing to do.' -ExitCode 0
     }
 
     Add-Action "Logging discovered Zoom entries"
     foreach ($e in $entries) {
         $versionText = if ($e.Version) { $e.Version.ToString() } else { 'Unknown' }
-        $stateText = if ($e.HasFiles) { 'Active' } else { 'RegistryOnly' }
+        $stateText   = if ($e.HasFiles) { 'Active' } else { 'RegistryOnly' }
         Add-Action "FOUND Name=[$($e.DisplayName)] Version=[$versionText] RawVersion=[$($e.DisplayVersion)] State=[$stateText]"
+    }
+    foreach ($pu in $perUserItems) {
+        $versionText = if ($pu.Version) { $pu.Version.ToString() } else { 'Unknown' }
+        Add-Action "FOUND Name=[$($pu.DisplayName)] Version=[$versionText] RawVersion=[$($pu.DisplayVersion)] Profile=[$($pu.ProfilePath)] State=[Active]"
     }
 
     $activeEntries = @($entries | Where-Object { $_.HasFiles })
-    if (-not $activeEntries.Count) {
+    if (-not $activeEntries.Count -and -not $perUserItems.Count) {
         Add-Action "No active Zoom install detected. Registry-only entries found; exiting without cleanup."
         Out-Result -Status 'OK' -Summary 'No active Zoom install detected. Logged findings only.' -ExitCode 0
     }
 
-    $candidates = @($activeEntries | Where-Object { $_.Version -and $_.Version -lt $minVersion })
+    $candidates        = @($activeEntries | Where-Object { $_.Version -and $_.Version -lt $minVersion })
+    $perUserCandidates = @($perUserItems  | Where-Object { $_.Version -and $_.Version -lt $minVersion })
 
-    if (-not $candidates.Count) {
+    if (-not $candidates.Count -and -not $perUserCandidates.Count) {
         Add-Action "Active Zoom detected, but no versions below minimum [$minVersion]"
         Out-Result -Status 'OK' -Summary "No Zoom versions below minimum [$minVersion]. Nothing to do." -ExitCode 0
     }
@@ -307,6 +439,9 @@ try {
     Add-Action "Candidates below minimum version:"
     foreach ($e in $candidates) {
         Add-Action "CANDIDATE Name=[$($e.DisplayName)] Version=[$($e.Version)]"
+    }
+    foreach ($pu in $perUserCandidates) {
+        Add-Action "CANDIDATE Name=[$($pu.DisplayName)] Version=[$($pu.Version)] Profile=[$($pu.ProfilePath)]"
     }
 
     if ($reportOnly) {
@@ -318,8 +453,12 @@ try {
                 Add-Action "REPORT skip Name=[$($e.DisplayName)] Version=[$($e.Version)] Reason=[No silent uninstall command]"
             }
         }
+        foreach ($pu in $perUserCandidates) {
+            Add-Action "REPORT uninstall Name=[$($pu.DisplayName)] Version=[$($pu.Version)] Command=[Remove $($pu.ZoomRoot)]"
+        }
 
-        Out-Result -Status 'ReportOnly' -Summary "Found $($candidates.Count) Zoom entries below minimum [$minVersion]. No changes made." -ExitCode 0
+        $totalCandidates = $candidates.Count + $perUserCandidates.Count
+        Out-Result -Status 'ReportOnly' -Summary "Found $totalCandidates Zoom entries below minimum [$minVersion]. No changes made." -ExitCode 0
     }
 
     if ($stopZoom) {
@@ -333,10 +472,11 @@ try {
                     Add-ErrorText "Failed stopping process $($_.ProcessName) PID=$($_.Id)"
                 }
             }
+        Start-Sleep -Seconds 3  # Allow OS to release file handles before uninstaller runs
     }
 
     foreach ($e in $candidates) {
-        $cmd = Build-UninstallCommand $e
+        $cmd   = Build-UninstallCommand $e
         $label = "$($e.DisplayName) [$($e.Version)]"
 
         if (-not $cmd) {
@@ -357,10 +497,24 @@ try {
         }
     }
 
-    if ($cleanupResiduals) {
-        $remaining = @(Get-ZoomEntries | Where-Object { $_.HasFiles })
+    foreach ($pu in $perUserCandidates) {
+        $label = "$($pu.DisplayName) [$($pu.Version)]"
 
-        if (-not $remaining.Count) {
+        try {
+            Add-Action "START per-user cleanup $label"
+            Remove-ItemSafe -Path $pu.ZoomRoot -Why "per-user Zoom below minimum [$minVersion]"
+            Remove-PerUserZoomRegistry -SID $pu.SID -ProfilePath $pu.ProfilePath
+            Add-Action "END per-user cleanup $label"
+        } catch {
+            Add-ErrorText "Per-user cleanup exception for $label: $($_.Exception.Message)"
+        }
+    }
+
+    if ($cleanupResiduals) {
+        $remaining        = @(Get-ZoomEntries | Where-Object { $_.HasFiles })
+        $remainingPerUser = @(Get-PerUserZoomInstalls)
+
+        if (-not $remaining.Count -and -not $remainingPerUser.Count) {
             Add-Action "No active Zoom install remains. Performing residual cleanup."
 
             foreach ($p in @(
@@ -376,17 +530,28 @@ try {
                     Remove-RegKeySafe -KeyPath $e.KeyPath -Why 'registry-only Zoom entry after removal'
                 }
             }
-        }
-        else {
+
+            foreach ($profile in @(Get-UserProfiles)) {
+                foreach ($relPath in @('AppData\Roaming\Zoom', 'AppData\Local\Zoom')) {
+                    $zoomPath = Join-Path $profile.ProfilePath $relPath
+                    if (Test-Path -LiteralPath $zoomPath) {
+                        Remove-ItemSafe -Path $zoomPath -Why 'per-user Zoom residual cleanup'
+                    }
+                }
+                Remove-PerUserZoomRegistry -SID $profile.SID -ProfilePath $profile.ProfilePath
+            }
+        } else {
             Add-Action "An active Zoom install still remains. Residual shared-folder cleanup skipped."
         }
     }
 
+    $totalProcessed = $candidates.Count + $perUserCandidates.Count
+
     if ($script:Errors.Count -gt 0) {
-        Out-Result -Status 'CompletedWithErrors' -Summary "Processed $($candidates.Count) candidate(s) below minimum [$minVersion] with errors." -ExitCode 1
+        Out-Result -Status 'CompletedWithErrors' -Summary "Processed $totalProcessed candidate(s) below minimum [$minVersion] with errors." -ExitCode 1
     }
 
-    Out-Result -Status 'Success' -Summary "Processed $($candidates.Count) candidate(s) below minimum [$minVersion]." -ExitCode 0
+    Out-Result -Status 'Success' -Summary "Processed $totalProcessed candidate(s) below minimum [$minVersion]." -ExitCode 0
 }
 catch {
     Add-ErrorText $_.Exception.Message
