@@ -1,3 +1,10 @@
+<#
+ Winget Script to auto upgrade packages where possible
+ V1.3
+ Author: Peter James
+#>
+
+
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
@@ -7,7 +14,7 @@ param(
 )
 
 Set-StrictMode -Off
-$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = "Stop"
 
 $script:ActionLines = @()
 $script:ErrorLines  = @()
@@ -19,33 +26,33 @@ function Get-Env([string]$Name) {
 
 function Get-EnvBool([string]$Name, [bool]$Default = $false) {
   $v = Get-Env $Name
-  if ($null -eq $v -or $v -eq '') { return $Default }
+  if ($null -eq $v -or $v -eq "") { return $Default }
 
   switch (($v.ToString()).Trim().ToLowerInvariant()) {
-    '1'     { return $true }
-    'true'  { return $true }
-    'yes'   { return $true }
-    'y'     { return $true }
-    'on'    { return $true }
-    '0'     { return $false }
-    'false' { return $false }
-    'no'    { return $false }
-    'n'     { return $false }
-    'off'   { return $false }
+    "1"     { return $true }
+    "true"  { return $true }
+    "yes"   { return $true }
+    "y"     { return $true }
+    "on"    { return $true }
+    "0"     { return $false }
+    "false" { return $false }
+    "no"    { return $false }
+    "n"     { return $false }
+    "off"   { return $false }
     default { return $Default }
   }
 }
 
-if (-not $PSBoundParameters.ContainsKey('ReportOnly')) {
-  $ReportOnly = Get-EnvBool 'ReportOnly' $false
+if (-not $PSBoundParameters.ContainsKey("ReportOnly")) {
+  $ReportOnly = Get-EnvBool "ReportOnly" $false
 }
 
-if (-not $PSBoundParameters.ContainsKey('Install_Winget_if_Not_Avaialble')) {
-  $Install_Winget_if_Not_Avaialble = Get-EnvBool 'Install_Winget_if_Not_Avaialble' $false
+if (-not $PSBoundParameters.ContainsKey("Install_Winget_if_Not_Avaialble")) {
+  $Install_Winget_if_Not_Avaialble = Get-EnvBool "Install_Winget_if_Not_Avaialble" $false
 }
 
-if (-not $PSBoundParameters.ContainsKey('LogPath')) {
-  $lp = Get-Env 'LogPath'
+if (-not $PSBoundParameters.ContainsKey("LogPath")) {
+  $lp = Get-Env "LogPath"
   if ($lp) { $LogPath = $lp }
 }
 
@@ -61,7 +68,7 @@ function Ensure-LogFile {
 
 function Write-Log([string]$Message) {
   Ensure-LogFile
-  $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+  $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
   $line = "[{0}] {1}" -f $ts, $Message
   try { Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 } catch {}
 }
@@ -74,6 +81,15 @@ function Add-Action([string]$Text) {
 function Add-ErrorText([string]$Text) {
   $script:ErrorLines += $Text
   Write-Log ("ERROR: {0}" -f $Text)
+}
+
+function Add-ActionLines {
+  param([string[]]$Lines)
+
+  foreach ($line in $Lines) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+    Add-Action $line
+  }
 }
 
 function Out-Result {
@@ -115,6 +131,274 @@ function Write-BlockToLog {
   Write-Log ("----- END {0} -----" -f $Title)
 }
 
+# ---------------- Text / parsing helpers ----------------
+function Read-TextFileSmart {
+  param([string]$Path)
+
+  if (-not (Test-Path -LiteralPath $Path)) { return "" }
+
+  try {
+    $utf8Strict = New-Object System.Text.UTF8Encoding($false, $true)
+    return [System.IO.File]::ReadAllText($Path, $utf8Strict)
+  } catch {}
+
+  try {
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+  } catch {}
+
+  try {
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Unicode)
+  } catch {}
+
+  try {
+    return [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::Default)
+  } catch {}
+
+  return ""
+}
+
+function Normalize-MojibakeLine {
+  param([string]$Line)
+
+  if ($null -eq $Line) { return $Line }
+
+  $line = $Line
+  $line = $line.Replace("â?¦", "...")
+  $line = $line.Replace("Â", "")
+  return $line
+}
+
+function Test-IsWingetNoticeLine {
+  param([string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+
+  $text = $Line.Trim()
+
+  if ($text -match "^The source requires") { return $true }
+  if ($text -match "current machine.*geographic region") { return $true }
+  if ($text -match "two-letter geographic region") { return $true }
+  if ($text -match "function properly.*US") { return $true }
+  if ($text -match "Do you agree to all the source agreements") { return $true }
+  if ($text -match "Terms of Transaction") { return $true }
+  if ($text -match "The source .* requires that you view") { return $true }
+  if ($text -match "Privacy Statement") { return $true }
+  if ($text -match "Microsoft Store source requires") { return $true }
+
+  return $false
+}
+
+function Test-IsProgressLine {
+  param([string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+
+  $trimmed = $Line.Trim()
+
+  if ($trimmed.Length -eq 1) {
+    $backslash = [string][char]92
+    if (@("-", "/", "|", $backslash) -contains $trimmed) {
+      return $true
+    }
+  }
+
+  if ($trimmed -match "\b\d+(\.\d+)?\s*(KB|MB|GB)\s*/\s*\d+(\.\d+)?\s*(KB|MB|GB)\b") {
+    return $true
+  }
+
+  return $false
+}
+
+function Test-IsSeparatorNoiseLine {
+  param([string]$Line)
+
+  if ([string]::IsNullOrWhiteSpace($Line)) { return $false }
+
+  $compact = ($Line -replace "\s", "")
+  if ([string]::IsNullOrWhiteSpace($compact)) { return $false }
+
+  # Keep real table separators made of dashes because they make the output readable.
+  if ($compact -match "^-{5,}$") { return $false }
+
+  # If there are no letters/numbers and the line is long, it is likely progress/bar noise.
+  if ($compact.Length -gt 5 -and $compact -notmatch "[A-Za-z0-9]") {
+    return $true
+  }
+
+  return $false
+}
+
+function Get-CleanWingetUpgradeLines {
+  param([string]$Content)
+
+  if ([string]::IsNullOrWhiteSpace($Content)) {
+    return @("[empty]")
+  }
+
+  $lines = $Content -split "`r?`n"
+  $result = @()
+
+  foreach ($raw in $lines) {
+    if ($null -eq $raw) { continue }
+
+    $line = Normalize-MojibakeLine ($raw.TrimEnd())
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+    if (Test-IsWingetNoticeLine -Line $line) { continue }
+    if (Test-IsProgressLine -Line $line) { continue }
+    if (Test-IsSeparatorNoiseLine -Line $line) { continue }
+
+    $result += $line
+  }
+
+  if ($result.Count -eq 0) {
+    return @("[empty]")
+  }
+
+  return $result
+}
+
+function Limit-Text {
+  param(
+    [string]$Text,
+    [int]$MaxLength
+  )
+
+  if ($null -eq $Text) { return "" }
+  if ($Text.Length -le $MaxLength) { return $Text }
+  if ($MaxLength -le 3) { return $Text.Substring(0, $MaxLength) }
+  return ($Text.Substring(0, $MaxLength - 3) + "...")
+}
+
+function Get-UpgradeItemsFromWingetOutput {
+  param([string]$Content)
+
+  $cleanLines = Get-CleanWingetUpgradeLines -Content $Content
+  $items = @()
+
+  foreach ($line in $cleanLines) {
+    if ([string]::IsNullOrWhiteSpace($line)) { continue }
+
+    $text = $line.Trim()
+    if ($text -eq "[empty]") { continue }
+    if (Test-IsWingetNoticeLine -Line $text) { continue }
+
+    if ($text -match "^\s*Name\s+Id\s+Version\s+Available\s+Source\s*$") { continue }
+    if ($text -match "^-{5,}$") { continue }
+    if ($text -match "^\s*\d+\s+upgrades?\s+available\.?\s*$") { continue }
+    if ($text -match "No installed package found") { continue }
+    if ($text -match "No available upgrade found") { continue }
+    if ($text -match "No applicable update found") { continue }
+
+    $parts = $text -split "\s+"
+    if ($parts.Count -lt 5) { continue }
+
+    $source    = $parts[$parts.Count - 1]
+    $available = $parts[$parts.Count - 2]
+    $version   = $parts[$parts.Count - 3]
+    $id        = $parts[$parts.Count - 4]
+
+    if ($parts.Count -gt 4) {
+      $nameParts = $parts[0..($parts.Count - 5)]
+      $name = ($nameParts -join " ")
+    } else {
+      $name = ""
+    }
+
+    if ([string]::IsNullOrWhiteSpace($name)) { continue }
+    if ([string]::IsNullOrWhiteSpace($id)) { continue }
+    if ([string]::IsNullOrWhiteSpace($version)) { continue }
+    if ([string]::IsNullOrWhiteSpace($available)) { continue }
+    if ([string]::IsNullOrWhiteSpace($source)) { continue }
+
+    # Source should normally be winget or msstore. This avoids parsing notices as package rows.
+    if ($source -notmatch "^(winget|msstore)$") { continue }
+
+    if ($id -eq "Id" -or $version -eq "Version" -or $available -eq "Available" -or $source -eq "Source") { continue }
+
+    $already = @($items | Where-Object { $_.Id -ieq $id })
+    if ($already.Count -gt 0) { continue }
+
+    $items += [pscustomobject]@{
+      Name      = $name
+      Id        = $id
+      Version   = $version
+      Available = $available
+      Source    = $source
+    }
+  }
+
+  return @($items)
+}
+
+function Format-UpgradeItems {
+  param(
+    [object[]]$Items,
+    [string]$EmptyMessage = "No upgradeable packages detected."
+  )
+
+  if ($null -eq $Items -or $Items.Count -eq 0) {
+    return @($EmptyMessage)
+  }
+
+  $nameWidth = 40
+  $idWidth = 42
+  $versionWidth = 18
+  $availableWidth = 18
+  $sourceWidth = 10
+
+  $fmt = "{0,-$nameWidth} {1,-$idWidth} {2,-$versionWidth} {3,-$availableWidth} {4,-$sourceWidth}"
+
+  $lines = @()
+  $lines += ($fmt -f "Name", "Id", "Version", "Available", "Source")
+  $lines += ($fmt -f "----", "--", "-------", "---------", "------")
+
+  foreach ($item in $Items) {
+    $lines += ($fmt -f `
+      (Limit-Text $item.Name $nameWidth), `
+      (Limit-Text $item.Id $idWidth), `
+      (Limit-Text $item.Version $versionWidth), `
+      (Limit-Text $item.Available $availableWidth), `
+      (Limit-Text $item.Source $sourceWidth))
+  }
+
+  $lines += ("Total actionable upgradeable packages: {0}" -f $Items.Count)
+
+  return $lines
+}
+
+function Test-ItemStillUpgradeable {
+  param(
+    [string]$Id,
+    [object[]]$RemainingItems
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Id)) { return $false }
+
+  foreach ($item in $RemainingItems) {
+    if ($item.Id -ieq $Id) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Get-SafeStepName {
+  param([string]$Text)
+
+  if ([string]::IsNullOrWhiteSpace($Text)) {
+    return "Package"
+  }
+
+  $safe = $Text -replace "[^A-Za-z0-9_.-]", "_"
+  if ($safe.Length -gt 60) {
+    $safe = $safe.Substring(0, 60)
+  }
+
+  return $safe
+}
+
 # ---------------- Winget helpers ----------------
 function Get-WingetPath {
   $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
@@ -122,19 +406,19 @@ function Get-WingetPath {
     return $cmd.Source
   }
 
-  $localAppDataPath = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+  $localAppDataPath = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"
   if (Test-Path -LiteralPath $localAppDataPath) {
     return $localAppDataPath
   }
 
-  $windowsApps = Join-Path $env:ProgramFiles 'WindowsApps'
+  $windowsApps = Join-Path $env:ProgramFiles "WindowsApps"
   if (Test-Path -LiteralPath $windowsApps) {
-    $candidate = Get-ChildItem -Path $windowsApps -Filter 'Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe' -Directory -ErrorAction SilentlyContinue |
+    $candidate = Get-ChildItem -Path $windowsApps -Filter "Microsoft.DesktopAppInstaller_*__8wekyb3d8bbwe" -Directory -ErrorAction SilentlyContinue |
       Sort-Object Name -Descending |
       Select-Object -First 1
 
     if ($candidate) {
-      $wingetExe = Join-Path $candidate.FullName 'winget.exe'
+      $wingetExe = Join-Path $candidate.FullName "winget.exe"
       if (Test-Path -LiteralPath $wingetExe) {
         return $wingetExe
       }
@@ -149,14 +433,14 @@ function Join-ArgumentList {
 
   $safeParts = foreach ($p in $Parts) {
     if ($null -eq $p) { continue }
-    if ($p -match '\s') {
-      '"{0}"' -f ($p -replace '"','\"')
+    if ($p -match "\s") {
+      '"{0}"' -f ($p -replace '"', '\"')
     } else {
       $p
     }
   }
 
-  return ($safeParts -join ' ')
+  return ($safeParts -join " ")
 }
 
 function Invoke-LoggedProcess {
@@ -167,12 +451,12 @@ function Invoke-LoggedProcess {
     [int]$TimeoutSec = 7200
   )
 
-  $tempDir = Join-Path $env:ProgramData 'Datto\Temp\WingetUpgradeAll'
+  $tempDir = Join-Path $env:ProgramData "Datto\Temp\WingetUpgradeAll"
   if (-not (Test-Path -LiteralPath $tempDir)) {
     New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
   }
 
-  $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
+  $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
   $stdoutPath = Join-Path $tempDir ("{0}-{1}-stdout.log" -f $StepName, $stamp)
   $stderrPath = Join-Path $tempDir ("{0}-{1}-stderr.log" -f $StepName, $stamp)
 
@@ -192,8 +476,8 @@ function Invoke-LoggedProcess {
       Add-ErrorText ("{0} timed out after {1} seconds" -f $StepName, $TimeoutSec)
       return [pscustomobject]@{
         ExitCode = -1
-        StdOut   = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
-        StdErr   = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+        StdOut   = Read-TextFileSmart -Path $stdoutPath
+        StdErr   = Read-TextFileSmart -Path $stderrPath
         TimedOut = $true
       }
     }
@@ -201,8 +485,8 @@ function Invoke-LoggedProcess {
 
   $result = [pscustomobject]@{
     ExitCode = [int]$proc.ExitCode
-    StdOut   = if (Test-Path $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue } else { '' }
-    StdErr   = if (Test-Path $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue } else { '' }
+    StdOut   = Read-TextFileSmart -Path $stdoutPath
+    StdErr   = Read-TextFileSmart -Path $stderrPath
     TimedOut = $false
   }
 
@@ -228,7 +512,6 @@ function Install-WingetIfNeeded {
 
   Add-Action "winget.exe not found; attempting registration/bootstrap"
 
-  # First try registering App Installer if it is already present
   try {
     Add-Action "Attempting App Installer registration"
     Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe -ErrorAction Stop
@@ -243,10 +526,9 @@ function Install-WingetIfNeeded {
     return $existing
   }
 
-  # Fallback bootstrap path via Microsoft.WinGet.Client
   try {
     Add-Action "Installing Microsoft.WinGet.Client module"
-    $progressPreference = 'SilentlyContinue'
+    $progressPreference = "SilentlyContinue"
     Install-PackageProvider -Name NuGet -Force | Out-Null
     Install-Module -Name Microsoft.WinGet.Client -Force -Repository PSGallery -Scope AllUsers | Out-Null
 
@@ -269,73 +551,177 @@ function Install-WingetIfNeeded {
 
 # ---------------- Main ----------------
 try {
-  Add-Action "SCRIPT_VERSION=2026-04-27-WINGET-UPGRADE-ALL-v2"
+  Add-Action "SCRIPT_VERSION=2026-04-27-WINGET-PER-PACKAGE-UPGRADE-v2"
   Add-Action ("Resolved variables: ReportOnly=[{0}] Install_Winget_if_Not_Avaialble=[{1}] LogPath=[{2}]" -f `
     [bool]$ReportOnly, [bool]$Install_Winget_if_Not_Avaialble, $LogPath)
 
   $wingetPath = Install-WingetIfNeeded
   if ([string]::IsNullOrWhiteSpace($wingetPath)) {
-    Out-Result -Status 'Failed' -Summary 'winget.exe was not found or could not be installed.' -ExitCode 1
+    Out-Result -Status "Failed" -Summary "winget.exe was not found or could not be installed." -ExitCode 1
   }
 
-  $versionResult = Invoke-LoggedProcess -Exe $wingetPath -Arguments @('--version') -StepName 'WingetVersion' -TimeoutSec 60
-  Write-BlockToLog -Title 'WingetVersion STDOUT' -Content $versionResult.StdOut
-  Write-BlockToLog -Title 'WingetVersion STDERR' -Content $versionResult.StdErr
+  $versionResult = Invoke-LoggedProcess -Exe $wingetPath -Arguments @("--version") -StepName "WingetVersion" -TimeoutSec 60
+  Write-BlockToLog -Title "WingetVersion STDOUT" -Content $versionResult.StdOut
+  Write-BlockToLog -Title "WingetVersion STDERR" -Content $versionResult.StdErr
 
-  $sourceReset = Invoke-LoggedProcess -Exe $wingetPath -Arguments @('source','reset','--force','--accept-source-agreements','--disable-interactivity') -StepName 'SourceReset' -TimeoutSec 600
-  Write-BlockToLog -Title 'SourceReset STDOUT' -Content $sourceReset.StdOut
-  Write-BlockToLog -Title 'SourceReset STDERR' -Content $sourceReset.StdErr
+  $sourceReset = Invoke-LoggedProcess -Exe $wingetPath -Arguments @("source","reset","--force","--accept-source-agreements","--disable-interactivity") -StepName "SourceReset" -TimeoutSec 600
+  Write-BlockToLog -Title "SourceReset STDOUT" -Content $sourceReset.StdOut
+  Write-BlockToLog -Title "SourceReset STDERR" -Content $sourceReset.StdErr
 
-  $sourceUpdate = Invoke-LoggedProcess -Exe $wingetPath -Arguments @('source','update','--accept-source-agreements','--disable-interactivity') -StepName 'SourceUpdate' -TimeoutSec 1200
-  Write-BlockToLog -Title 'SourceUpdate STDOUT' -Content $sourceUpdate.StdOut
-  Write-BlockToLog -Title 'SourceUpdate STDERR' -Content $sourceUpdate.StdErr
+  $sourceUpdate = Invoke-LoggedProcess -Exe $wingetPath -Arguments @("source","update","--accept-source-agreements","--disable-interactivity") -StepName "SourceUpdate" -TimeoutSec 1200
+  Write-BlockToLog -Title "SourceUpdate STDOUT" -Content $sourceUpdate.StdOut
+  Write-BlockToLog -Title "SourceUpdate STDERR" -Content $sourceUpdate.StdErr
 
-  $listArgs = @('list','--upgrade-available','--accept-source-agreements','--disable-interactivity')
-  $preScan = Invoke-LoggedProcess -Exe $wingetPath -Arguments $listArgs -StepName 'PreScan' -TimeoutSec 1800
-  Write-BlockToLog -Title 'PreScan STDOUT' -Content $preScan.StdOut
-  Write-BlockToLog -Title 'PreScan STDERR' -Content $preScan.StdErr
+  $listArgs = @("list","--upgrade-available","--accept-source-agreements","--disable-interactivity")
+  $preScan = Invoke-LoggedProcess -Exe $wingetPath -Arguments $listArgs -StepName "PreScan" -TimeoutSec 1800
+
+  $combinedPreScan = @(
+    $preScan.StdOut
+    $preScan.StdErr
+  ) -join "`r`n"
+
+  Write-BlockToLog -Title "PreScan COMBINED INPUT" -Content $combinedPreScan
+  Write-BlockToLog -Title "PreScan STDOUT" -Content $preScan.StdOut
+  Write-BlockToLog -Title "PreScan STDERR" -Content $preScan.StdErr
 
   if ($preScan.TimedOut) {
-    Out-Result -Status 'CompletedWithErrors' -Summary 'winget pre-scan timed out.' -ExitCode 1
+    Out-Result -Status "CompletedWithErrors" -Summary "winget pre-scan timed out." -ExitCode 1
   }
+
+  $upgradeItems = @(Get-UpgradeItemsFromWingetOutput -Content $combinedPreScan)
+
+  Add-Action "Upgradeable packages detected by winget:"
+  Add-Action "BEGIN UPGRADEABLE PACKAGE LIST"
+  Add-ActionLines -Lines (Format-UpgradeItems -Items $upgradeItems)
+  Add-Action "END UPGRADEABLE PACKAGE LIST"
 
   if ([bool]$ReportOnly) {
-    Out-Result -Status 'ReportOnly' -Summary 'Report-only mode complete. Review the log for upgradeable packages.' -ExitCode 0
+    Out-Result -Status "ReportOnly" -Summary ("Report-only mode complete. Found {0} actionable upgradeable package(s)." -f $upgradeItems.Count) -ExitCode 0
   }
 
-  $wingetNativeLog = Join-Path $env:ProgramData ("Datto\Logs\winget-upgrade-{0}.log" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
-  $upgradeArgs = @(
-    'upgrade',
-    '--all',
-    '--silent',
-    '--accept-package-agreements',
-    '--accept-source-agreements',
-    '--disable-interactivity',
-    '--nowarn',
-    '--log', $wingetNativeLog
-  )
-
-  Add-Action ("Winget native log path [{0}]" -f $wingetNativeLog)
-
-  $upgradeResult = Invoke-LoggedProcess -Exe $wingetPath -Arguments $upgradeArgs -StepName 'UpgradeAll' -TimeoutSec 7200
-  Write-BlockToLog -Title 'UpgradeAll STDOUT' -Content $upgradeResult.StdOut
-  Write-BlockToLog -Title 'UpgradeAll STDERR' -Content $upgradeResult.StdErr
-
-  $postScan = Invoke-LoggedProcess -Exe $wingetPath -Arguments $listArgs -StepName 'PostScan' -TimeoutSec 1800
-  Write-BlockToLog -Title 'PostScan STDOUT' -Content $postScan.StdOut
-  Write-BlockToLog -Title 'PostScan STDERR' -Content $postScan.StdErr
-
-  if ($upgradeResult.TimedOut) {
-    Out-Result -Status 'CompletedWithErrors' -Summary 'winget upgrade timed out. Review the log.' -ExitCode 1
+  if ($upgradeItems.Count -eq 0) {
+    Out-Result -Status "Success" -Summary "No upgradeable packages detected. Nothing to do." -ExitCode 0
   }
 
-  if ($upgradeResult.ExitCode -ne 0) {
-    Out-Result -Status 'CompletedWithErrors' -Summary ("winget upgrade exited with code {0}. Review the log." -f $upgradeResult.ExitCode) -ExitCode 1
+  $packageResults = @()
+
+  foreach ($item in $upgradeItems) {
+    $safeStepName = Get-SafeStepName -Text $item.Id
+    $wingetNativeLog = Join-Path $env:ProgramData ("Datto\Logs\winget-upgrade-{0}-{1}.log" -f $safeStepName, (Get-Date -Format "yyyyMMdd-HHmmss"))
+
+    $upgradeArgs = @(
+      "upgrade",
+      "--id", $item.Id,
+      "--exact",
+      "--silent",
+      "--accept-package-agreements",
+      "--accept-source-agreements",
+      "--disable-interactivity",
+      "--nowarn",
+      "--log", $wingetNativeLog
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($item.Source)) {
+      $upgradeArgs += "--source"
+      $upgradeArgs += $item.Source
+    }
+
+    Add-Action ("PACKAGE START Name=[{0}] Id=[{1}] Current=[{2}] Available=[{3}] Source=[{4}]" -f `
+      $item.Name, $item.Id, $item.Version, $item.Available, $item.Source)
+    Add-Action ("PACKAGE WINGET LOG Id=[{0}] Log=[{1}]" -f $item.Id, $wingetNativeLog)
+
+    $result = Invoke-LoggedProcess -Exe $wingetPath -Arguments $upgradeArgs -StepName ("Upgrade_" + $safeStepName) -TimeoutSec 3600
+
+    Write-BlockToLog -Title ("Upgrade {0} STDOUT" -f $item.Id) -Content $result.StdOut
+    Write-BlockToLog -Title ("Upgrade {0} STDERR" -f $item.Id) -Content $result.StdErr
+
+    if ($result.TimedOut) {
+      Add-ErrorText ("PACKAGE COMMAND TIMED OUT Name=[{0}] Id=[{1}]" -f $item.Name, $item.Id)
+    }
+    elseif ($result.ExitCode -eq 0) {
+      Add-Action ("PACKAGE COMMAND SUCCESS Name=[{0}] Id=[{1}] ExitCode=[{2}]" -f $item.Name, $item.Id, $result.ExitCode)
+    }
+    else {
+      Add-ErrorText ("PACKAGE COMMAND FAILED Name=[{0}] Id=[{1}] ExitCode=[{2}]" -f $item.Name, $item.Id, $result.ExitCode)
+    }
+
+    $packageResults += [pscustomobject]@{
+      Name      = $item.Name
+      Id        = $item.Id
+      Version   = $item.Version
+      Available = $item.Available
+      Source    = $item.Source
+      ExitCode  = $result.ExitCode
+      TimedOut  = $result.TimedOut
+      LogPath   = $wingetNativeLog
+    }
   }
 
-  Out-Result -Status 'Success' -Summary 'winget upgrade completed. Review the log for details and post-scan results.' -ExitCode 0
+  $postScan = Invoke-LoggedProcess -Exe $wingetPath -Arguments $listArgs -StepName "PostScan" -TimeoutSec 1800
+
+  $combinedPostScan = @(
+    $postScan.StdOut
+    $postScan.StdErr
+  ) -join "`r`n"
+
+  Write-BlockToLog -Title "PostScan COMBINED INPUT" -Content $combinedPostScan
+  Write-BlockToLog -Title "PostScan STDOUT" -Content $postScan.StdOut
+  Write-BlockToLog -Title "PostScan STDERR" -Content $postScan.StdErr
+
+  $remainingItems = @(Get-UpgradeItemsFromWingetOutput -Content $combinedPostScan)
+
+  Add-Action "Post-upgrade remaining upgradeable packages:"
+  Add-Action "BEGIN REMAINING PACKAGE LIST"
+  Add-ActionLines -Lines (Format-UpgradeItems -Items $remainingItems -EmptyMessage "No remaining actionable upgradeable packages detected.")
+  Add-Action "END REMAINING PACKAGE LIST"
+
+  $failedCount = 0
+  $stillUpgradeableCount = 0
+  $successCount = 0
+
+  Add-Action "Per-package final result summary:"
+  Add-Action "BEGIN PACKAGE RESULT SUMMARY"
+
+  foreach ($pkg in $packageResults) {
+    $stillUpgradeable = Test-ItemStillUpgradeable -Id $pkg.Id -RemainingItems $remainingItems
+
+    if ($pkg.TimedOut) {
+      $failedCount++
+      Add-Action ("RESULT=FAILED_TIMEOUT Name=[{0}] Id=[{1}] From=[{2}] To=[{3}] ExitCode=[{4}]" -f `
+        $pkg.Name, $pkg.Id, $pkg.Version, $pkg.Available, $pkg.ExitCode)
+      continue
+    }
+
+    if ($pkg.ExitCode -ne 0) {
+      $failedCount++
+      Add-Action ("RESULT=FAILED_EXITCODE Name=[{0}] Id=[{1}] From=[{2}] To=[{3}] ExitCode=[{4}]" -f `
+        $pkg.Name, $pkg.Id, $pkg.Version, $pkg.Available, $pkg.ExitCode)
+      continue
+    }
+
+    if ($stillUpgradeable) {
+      $stillUpgradeableCount++
+      Add-Action ("RESULT=STILL_UPGRADEABLE Name=[{0}] Id=[{1}] From=[{2}] To=[{3}] ExitCode=[{4}]" -f `
+        $pkg.Name, $pkg.Id, $pkg.Version, $pkg.Available, $pkg.ExitCode)
+      continue
+    }
+
+    $successCount++
+    Add-Action ("RESULT=SUCCESS Name=[{0}] Id=[{1}] From=[{2}] To=[{3}] ExitCode=[{4}]" -f `
+      $pkg.Name, $pkg.Id, $pkg.Version, $pkg.Available, $pkg.ExitCode)
+  }
+
+  Add-Action "END PACKAGE RESULT SUMMARY"
+
+  $summary = "Attempted=$($packageResults.Count) Success=$successCount Failed=$failedCount StillUpgradeable=$stillUpgradeableCount Remaining=$($remainingItems.Count)"
+
+  if ($failedCount -gt 0 -or $stillUpgradeableCount -gt 0) {
+    Out-Result -Status "CompletedWithErrors" -Summary $summary -ExitCode 1
+  }
+
+  Out-Result -Status "Success" -Summary $summary -ExitCode 0
 }
 catch {
   Add-ErrorText ("Fatal exception: {0}" -f $_.Exception.Message)
-  Out-Result -Status 'Failed' -Summary 'Script failed unexpectedly.' -ExitCode 1
+  Out-Result -Status "Failed" -Summary "Script failed unexpectedly." -ExitCode 1
 }
