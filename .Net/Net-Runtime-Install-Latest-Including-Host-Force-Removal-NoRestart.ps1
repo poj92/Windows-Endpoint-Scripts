@@ -7,17 +7,19 @@ Behavior:
   using both folder and ARP views.
 - TargetChannel defaults to the LTS channel derived from MinKeepVersion (major.minor)
   when not explicitly set.
-- Installs latest for a family/arch ONLY if:
-    (a) there are below-min items for that family/arch (ARP or folder), AND
-    (b) there is NOT already a compliant (>= MinKeepVersion) folder version
-        for that same family/arch.
-- Removes below-min ARP packages for managed families only:
+- Installs latest for a family/arch if:
+    (a) there are below-min items for that family/arch (ARP or folder), OR
+    (b) that same target-channel family/arch is installed but below the latest patch.
+- Does NOT skip simply because a compliant (>= MinKeepVersion) folder exists;
+  it skips only when the target-channel latest patch is already present.
+- Removes below-min ARP packages and target-channel old patch ARP packages for managed families only:
     SDK / Runtime / ASP.NET Core / Windows Desktop.
 - Dedupes ARP uninstalls to avoid duplicate 1605 spam.
 - Treats MSI exit codes 0 / 1605 / 1614 / 3010 as OK.
 - Tracks 3010 as reboot-required, but does not force restart.
-- Performs aggressive folder cleanup (best-effort) for x64 and optionally x86.
-- Post-check logs any remaining below-min ARP items.
+- Performs aggressive folder cleanup (best-effort) for x64 and optionally x86,
+  including host\fxr cleanup when Runtime is remediated.
+- Post-check logs any remaining below-min or below-target-latest ARP items.
 
 Datto RMM env vars:
   DotNet_MinKeepVersion           (required)
@@ -136,6 +138,67 @@ function Get-MaxVersion($versions) {
   $v[0]
 }
 
+function Test-SameChannel {
+  param(
+    [Version]$Version,
+    [string]$ChannelVersion
+  )
+
+  if (-not $Version -or [string]::IsNullOrWhiteSpace($ChannelVersion)) { return $false }
+  $parts = $ChannelVersion.Split('.')
+  if ($parts.Count -lt 2) { return $false }
+
+  return ($Version.Major -eq [int]$parts[0] -and $Version.Minor -eq [int]$parts[1])
+}
+
+function Get-LatestVersionForFamily {
+  param(
+    [Parameter(Mandatory)]$Latest,
+    [Parameter(Mandatory)][ValidateSet('SDK','Runtime','AspNet','Desktop')]$Family
+  )
+
+  $raw = switch ($Family) {
+    'SDK'     { $Latest.SdkVersion }
+    'Runtime' { $Latest.RuntimeVersion }
+    'AspNet'  { $Latest.AspNetVersion }
+    'Desktop' { $Latest.DesktopVersion }
+  }
+
+  Parse-Version3Or4 $raw
+}
+
+function Get-MaxTargetChannelVersion {
+  param(
+    $Versions,
+    [string]$TargetChannel
+  )
+
+  Get-MaxVersion (@($Versions) | Where-Object { Test-SameChannel $_ $TargetChannel })
+}
+
+function Has-TargetLatestFolderVersion {
+  param(
+    [ValidateSet('SDK', 'Runtime', 'AspNet', 'Desktop')]$Family,
+    [ValidateSet('x64', 'x86')]$Arch,
+    [Parameter(Mandatory)]$Latest,
+    [string]$TargetChannel
+  )
+
+  $latestVersion = Get-LatestVersionForFamily -Latest $Latest -Family $Family
+  if (-not $latestVersion) { return $false }
+
+  $inv = Get-DotNetInventory $Arch
+  $list = switch ($Family) {
+    'SDK'     { $inv.SDK }
+    'Runtime' { $inv.Runtime }
+    'AspNet'  { $inv.AspNet }
+    'Desktop' { $inv.Desktop }
+  }
+
+  $maxTarget = Get-MaxTargetChannelVersion -Versions $list -TargetChannel $TargetChannel
+  return ($maxTarget -and $maxTarget -ge $latestVersion)
+}
+
 # ---------------- Release metadata ----------------
 function Get-LatestChannelInfo {
   param(
@@ -248,6 +311,7 @@ function Get-DotNetInventory([ValidateSet('x64', 'x86')]$Arch) {
     Runtime = Get-VersionsFromDirs (Join-Path $root "shared\Microsoft.NETCore.App")
     AspNet  = Get-VersionsFromDirs (Join-Path $root "shared\Microsoft.AspNetCore.App")
     Desktop = Get-VersionsFromDirs (Join-Path $root "shared\Microsoft.WindowsDesktop.App")
+    HostFxr = Get-VersionsFromDirs (Join-Path $root "host\fxr")
   }
 }
 
@@ -363,6 +427,69 @@ function Get-DotNetArpBelowMin {
   return $out
 }
 
+
+function Get-DotNetArpBelowLatestForTarget {
+  param(
+    [Parameter(Mandatory)]$Latest,
+    [Parameter(Mandatory)][string]$TargetChannel,
+    [switch]$IncludeX86
+  )
+
+  $want = @('x64')
+  if ($IncludeX86) { $want += 'x86' }
+
+  $out = @()
+
+  foreach ($e in Get-ArpEntries) {
+    $dn = [string]$e.DisplayName
+
+    if ($dn -notmatch '(?i)\bMicrosoft\b') { continue }
+    if ($dn -notmatch '(?i)\.NET|ASP\.NET|Windows Desktop Runtime|Hosting Bundle|HostFxr|Host FX Resolver') { continue }
+
+    $fam = Classify-DotNetArpFamily $dn
+    if (-not $fam) { continue }
+
+    $arch = Get-ArchFromName $dn
+    if ($arch -eq 'arm64') { continue }
+    if ($arch -and ($want -notcontains $arch)) { continue }
+
+    $ver = Parse-Version3Or4 $e.DisplayVersion
+    if (-not $ver) {
+      $m = [regex]::Match($dn, '(\d+\.\d+\.\d+(?:\.\d+)?)')
+      if ($m.Success) { $ver = Parse-Version3Or4 $m.Value }
+    }
+    if (-not $ver) { continue }
+    if (-not (Test-SameChannel $ver $TargetChannel)) { continue }
+
+    $latestVersion = Get-LatestVersionForFamily -Latest $Latest -Family $fam
+    if (-not $latestVersion) { continue }
+
+    if ($ver -lt $latestVersion) {
+      $archOut = if ($arch) { $arch } else { '' }
+      $out += [pscustomobject]@{
+        Family  = $fam
+        Arch    = $archOut
+        Version = $ver
+        Entry   = $e
+        Reason  = 'BelowTargetLatest'
+      }
+    }
+  }
+
+  return $out
+}
+
+function Get-UniqueArpItems($Items) {
+  $Items | Group-Object -Property @{
+    Expression = {
+      $cmd = $_.Entry.QuietUninstallString
+      if ([string]::IsNullOrWhiteSpace($cmd)) { $cmd = $_.Entry.UninstallString }
+      if ([string]::IsNullOrWhiteSpace($cmd)) { $cmd = $_.Entry.DisplayName }
+      "{0}|{1}|{2}" -f $_.Family, $_.Version, $cmd
+    }
+  } | ForEach-Object { $_.Group | Select-Object -First 1 }
+}
+
 function Normalize-MsiUninstall([string]$Cmd, [switch]$Force) {
   if (-not $Cmd) { return $null }
 
@@ -472,10 +599,39 @@ function Remove-FolderIfBelowMin([string]$Path, [Version]$Min) {
   return $hadFailures
 }
 
+function Remove-FolderIfBelowTargetLatest([string]$Path, [Version]$LatestVersion, [string]$TargetChannel) {
+  if (-not (Test-Path $Path)) { return $false }
+  if (-not $LatestVersion) { return $false }
+
+  $hadFailures = $false
+
+  Get-ChildItem -Path $Path -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+    $folder = $_
+    $v = Parse-Version3Or4 $folder.Name
+    if ($v -and (Test-SameChannel $v $TargetChannel) -and $v -lt $LatestVersion) {
+      if ($PSCmdlet.ShouldProcess($folder.FullName, "Delete older target-channel folder")) {
+        try {
+          Remove-Item -Path $folder.FullName -Recurse -Force -ErrorAction Stop
+          Write-Log "Deleted older target-channel folder: $($folder.FullName)"
+        }
+        catch {
+          $hadFailures = $true
+          Write-Log "WARNING: Failed to delete folder $($folder.FullName) : $($_.Exception.Message)"
+        }
+      }
+      else {
+        Write-Log "WhatIf/Confirm prevented deletion of folder '$($folder.FullName)'"
+      }
+    }
+  }
+
+  return $hadFailures
+}
+
 function Get-FamilyVersionsFromInventory($Inventory, [string]$Family) {
   switch ($Family) {
     'SDK'     { $Inventory.SDK }
-    'Runtime' { $Inventory.Runtime }
+    'Runtime' { (@($Inventory.Runtime) + @($Inventory.HostFxr)) | Sort-Object -Unique }
     'AspNet'  { $Inventory.AspNet }
     'Desktop' { $Inventory.Desktop }
     default   { @() }
@@ -485,10 +641,13 @@ function Get-FamilyVersionsFromInventory($Inventory, [string]$Family) {
 function Test-NeedsActionForFamilyArch {
   param(
     [Parameter(Mandatory)]$BelowArp,
+    [Parameter(Mandatory)]$TargetBelowLatestArp,
     [Parameter(Mandatory)]$Inventory,
     [Parameter(Mandatory)][ValidateSet('SDK','Runtime','AspNet','Desktop')]$Family,
     [Parameter(Mandatory)][ValidateSet('x64','x86')]$Arch,
-    [Parameter(Mandatory)][Version]$MinKeepObj
+    [Parameter(Mandatory)][Version]$MinKeepObj,
+    [Parameter(Mandatory)]$Latest,
+    [Parameter(Mandatory)][string]$TargetChannel
   )
 
   $arpHit = @(
@@ -500,9 +659,28 @@ function Test-NeedsActionForFamilyArch {
     }
   ).Count -gt 0
 
-  $folderHit = (BelowMin (Get-FamilyVersionsFromInventory -Inventory $Inventory -Family $Family) $MinKeepObj).Count -gt 0
+  $targetArpHit = @(
+    $TargetBelowLatestArp | Where-Object {
+      $_.Family -eq $Family -and (
+        $_.Arch -eq $Arch -or
+        [string]::IsNullOrWhiteSpace($_.Arch)
+      )
+    }
+  ).Count -gt 0
 
-  return ($arpHit -or $folderHit)
+  $versions = Get-FamilyVersionsFromInventory -Inventory $Inventory -Family $Family
+  $folderHit = (BelowMin $versions $MinKeepObj).Count -gt 0
+
+  $latestVersion = Get-LatestVersionForFamily -Latest $Latest -Family $Family
+  $targetFolderOutdated = @(
+    $versions | Where-Object {
+      $latestVersion -and
+      (Test-SameChannel $_ $TargetChannel) -and
+      $_ -lt $latestVersion
+    }
+  ).Count -gt 0
+
+  return ($arpHit -or $targetArpHit -or $folderHit -or $targetFolderOutdated)
 }
 
 function Install-IfNeeded {
@@ -511,13 +689,14 @@ function Install-IfNeeded {
     [Parameter(Mandatory)][ValidateSet('x64','x86')]$Arch,
     [Parameter(Mandatory)][bool]$Needed,
     [Parameter(Mandatory)][Version]$MinKeepObj,
-    [Parameter(Mandatory)]$Latest
+    [Parameter(Mandatory)]$Latest,
+    [Parameter(Mandatory)][string]$TargetChannel
   )
 
   if (-not $Needed) { return }
 
-  if (Has-CompliantFolderVersion -Family $Family -Arch $Arch -MinKeepObj $MinKeepObj) {
-    Write-Log ("Skipping {0} install ({1}): compliant version already present." -f $Family, $Arch)
+  if (Has-TargetLatestFolderVersion -Family $Family -Arch $Arch -Latest $Latest -TargetChannel $TargetChannel) {
+    Write-Log ("Skipping {0} install ({1}): target latest version is already present." -f $Family, $Arch)
     return
   }
 
@@ -565,6 +744,7 @@ try {
   Write-Log ("  Runtime : {0}" -f (Format-VersionList $invX64.Runtime))
   Write-Log ("  AspNet  : {0}" -f (Format-VersionList $invX64.AspNet))
   Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX64.Desktop))
+  Write-Log ("  HostFxr : {0}" -f (Format-VersionList $invX64.HostFxr))
 
   if ($IncludeX86) {
     Write-Log "Installed .NET inventory (folders) (x86):"
@@ -572,6 +752,7 @@ try {
     Write-Log ("  Runtime : {0}" -f (Format-VersionList $invX86.Runtime))
     Write-Log ("  AspNet  : {0}" -f (Format-VersionList $invX86.AspNet))
     Write-Log ("  Desktop : {0}" -f (Format-VersionList $invX86.Desktop))
+    Write-Log ("  HostFxr : {0}" -f (Format-VersionList $invX86.HostFxr))
   }
 
   $belowArp = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
@@ -581,22 +762,41 @@ try {
     Write-Log ("  Below-min ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
   }
 
+  $ch = Get-LatestChannelInfo -ChannelVersion $TargetChannel -LtsOnly:$LatestLTSOnly
+  if (-not $ch -and $LatestLTSOnly) {
+    Write-Log ("WARNING: No active LTS channel found for '{0}'. Falling back to highest active LTS." -f $TargetChannel)
+    $ch = Get-LatestChannelInfo -ChannelVersion $null -LtsOnly:$true
+  }
+  if (-not $ch) {
+    throw "Could not resolve .NET channel."
+  }
+
+  Write-Log ("Selected channel {0} ({1}) latest release {2}" -f $ch.ChannelVersion, $ch.ReleaseType, $ch.LatestRelease)
+  $latest = Get-LatestInstallersForRelease -ReleasesJsonUrl $ch.ReleasesJsonUrl -LatestRelease $ch.LatestRelease
+  Write-Log ("Latest component versions: Runtime={0} AspNet={1} Desktop={2} SDK={3}" -f $latest.RuntimeVersion, $latest.AspNetVersion, $latest.DesktopVersion, $latest.SdkVersion)
+
+  $targetBelowLatestArp = @(Get-DotNetArpBelowLatestForTarget -Latest $latest -TargetChannel $ch.ChannelVersion -IncludeX86:$IncludeX86)
+  Write-Log ("Below-target-latest (ARP, target channel {0}): {1} item(s)" -f $ch.ChannelVersion, $targetBelowLatestArp.Count)
+  foreach ($x in ($targetBelowLatestArp | Sort-Object Family, Arch, Version)) {
+    Write-Log ("  Below-target-latest ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
+  }
+
   $need = [ordered]@{
     Runtime = [ordered]@{
-      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX64 -Family Runtime -Arch x64 -MinKeepObj $minKeepObj
-      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX86 -Family Runtime -Arch x86 -MinKeepObj $minKeepObj } else { $false }
+      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX64 -Family Runtime -Arch x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX86 -Family Runtime -Arch x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion } else { $false }
     }
     AspNet = [ordered]@{
-      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX64 -Family AspNet -Arch x64 -MinKeepObj $minKeepObj
-      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX86 -Family AspNet -Arch x86 -MinKeepObj $minKeepObj } else { $false }
+      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX64 -Family AspNet -Arch x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX86 -Family AspNet -Arch x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion } else { $false }
     }
     Desktop = [ordered]@{
-      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX64 -Family Desktop -Arch x64 -MinKeepObj $minKeepObj
-      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX86 -Family Desktop -Arch x86 -MinKeepObj $minKeepObj } else { $false }
+      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX64 -Family Desktop -Arch x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX86 -Family Desktop -Arch x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion } else { $false }
     }
     SDK = [ordered]@{
-      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX64 -Family SDK -Arch x64 -MinKeepObj $minKeepObj
-      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -Inventory $invX86 -Family SDK -Arch x86 -MinKeepObj $minKeepObj } else { $false }
+      x64 = Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX64 -Family SDK -Arch x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+      x86 = if ($IncludeX86) { Test-NeedsActionForFamilyArch -BelowArp $belowArp -TargetBelowLatestArp $targetBelowLatestArp -Inventory $invX86 -Family SDK -Arch x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion } else { $false }
     }
   }
 
@@ -617,45 +817,36 @@ try {
   $folderCleanupFailures = $false
 
   if (-not $anyNeed) {
-    Write-Log "No versions below MinKeepVersion were found in the monitored .NET families. Skipping install/uninstall by design."
+    Write-Log "No versions below MinKeepVersion and no target-channel components below the latest patch were found. Skipping install/uninstall by design."
     exit 0
   }
 
-  $ch = Get-LatestChannelInfo -ChannelVersion $TargetChannel -LtsOnly:$LatestLTSOnly
-  if (-not $ch -and $LatestLTSOnly) {
-    Write-Log ("WARNING: No active LTS channel found for '{0}'. Falling back to highest active LTS." -f $TargetChannel)
-    $ch = Get-LatestChannelInfo -ChannelVersion $null -LtsOnly:$true
-  }
-  if (-not $ch) {
-    throw "Could not resolve .NET channel."
-  }
-
-  Write-Log ("Selected channel {0} ({1}) latest release {2}" -f $ch.ChannelVersion, $ch.ReleaseType, $ch.LatestRelease)
-  $latest = Get-LatestInstallersForRelease -ReleasesJsonUrl $ch.ReleasesJsonUrl -LatestRelease $ch.LatestRelease
-
   if ($ReportOnly) {
-    Write-Log "ReportOnly: would install latest for family/arch pairs with below-min items and no compliant folder version; then uninstall below-min ARP entries for the monitored .NET families."
+    Write-Log "ReportOnly: would install latest for family/arch pairs with below-min items or target-channel components below the latest patch; then uninstall below-min and below-target-latest ARP entries for the monitored .NET families."
     exit 0
   }
 
   # Install latest only if needed for that same arch and not already compliant on disk
-  Install-IfNeeded -Family Runtime -Arch x64 -Needed $need.Runtime.x64 -MinKeepObj $minKeepObj -Latest $latest
-  if ($IncludeX86) { Install-IfNeeded -Family Runtime -Arch x86 -Needed $need.Runtime.x86 -MinKeepObj $minKeepObj -Latest $latest }
+  Install-IfNeeded -Family Runtime -Arch x64 -Needed $need.Runtime.x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+  if ($IncludeX86) { Install-IfNeeded -Family Runtime -Arch x86 -Needed $need.Runtime.x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion }
 
-  Install-IfNeeded -Family AspNet -Arch x64 -Needed $need.AspNet.x64 -MinKeepObj $minKeepObj -Latest $latest
-  if ($IncludeX86) { Install-IfNeeded -Family AspNet -Arch x86 -Needed $need.AspNet.x86 -MinKeepObj $minKeepObj -Latest $latest }
+  Install-IfNeeded -Family AspNet -Arch x64 -Needed $need.AspNet.x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+  if ($IncludeX86) { Install-IfNeeded -Family AspNet -Arch x86 -Needed $need.AspNet.x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion }
 
-  Install-IfNeeded -Family Desktop -Arch x64 -Needed $need.Desktop.x64 -MinKeepObj $minKeepObj -Latest $latest
-  if ($IncludeX86) { Install-IfNeeded -Family Desktop -Arch x86 -Needed $need.Desktop.x86 -MinKeepObj $minKeepObj -Latest $latest }
+  Install-IfNeeded -Family Desktop -Arch x64 -Needed $need.Desktop.x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+  if ($IncludeX86) { Install-IfNeeded -Family Desktop -Arch x86 -Needed $need.Desktop.x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion }
 
-  Install-IfNeeded -Family SDK -Arch x64 -Needed $need.SDK.x64 -MinKeepObj $minKeepObj -Latest $latest
-  if ($IncludeX86) { Install-IfNeeded -Family SDK -Arch x86 -Needed $need.SDK.x86 -MinKeepObj $minKeepObj -Latest $latest }
+  Install-IfNeeded -Family SDK -Arch x64 -Needed $need.SDK.x64 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion
+  if ($IncludeX86) { Install-IfNeeded -Family SDK -Arch x86 -Needed $need.SDK.x86 -MinKeepObj $minKeepObj -Latest $latest -TargetChannel $ch.ChannelVersion }
 
-  # Re-evaluate below-min ARP after installs, then dedupe uninstall by normalized uninstall command
+  # Re-evaluate ARP after installs, then dedupe uninstall by normalized uninstall command.
+  # This removes both unsupported/below-min versions and old patch levels within the target channel.
   $belowArp2 = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
+  $targetBelowLatestArp2 = @(Get-DotNetArpBelowLatestForTarget -Latest $latest -TargetChannel $ch.ChannelVersion -IncludeX86:$IncludeX86)
+  $arpToRemove = @(Get-UniqueArpItems (@($belowArp2) + @($targetBelowLatestArp2)))
 
-  if ($belowArp2.Count -gt 0) {
-    $groups = $belowArp2 | Group-Object -Property @{
+  if ($arpToRemove.Count -gt 0) {
+    $groups = $arpToRemove | Group-Object -Property @{
       Expression = {
         $cmd = $_.Entry.QuietUninstallString
         if ([string]::IsNullOrWhiteSpace($cmd)) { $cmd = $_.Entry.UninstallString }
@@ -664,7 +855,7 @@ try {
       }
     }
 
-    Write-Log ("ARP packages below min to remove: {0} (dedup groups={1})" -f $belowArp2.Count, $groups.Count)
+    Write-Log ("ARP packages to remove: {0} (below-min={1}, below-target-latest={2}, dedup groups={3})" -f $arpToRemove.Count, $belowArp2.Count, $targetBelowLatestArp2.Count, $groups.Count)
 
     foreach ($g in $groups) {
       $item = $g.Group | Select-Object -First 1
@@ -675,36 +866,71 @@ try {
     }
   }
   else {
-    Write-Log "No below-min ARP packages found to uninstall."
+    Write-Log "No below-min or below-target-latest ARP packages found to uninstall."
   }
 
   # Folder cleanup (aggressive best effort, but do not force restart)
+  $runtimeLatestVersion = Get-LatestVersionForFamily -Latest $latest -Family Runtime
+  $aspNetLatestVersion  = Get-LatestVersionForFamily -Latest $latest -Family AspNet
+  $desktopLatestVersion = Get-LatestVersionForFamily -Latest $latest -Family Desktop
+  $sdkLatestVersion     = Get-LatestVersionForFamily -Latest $latest -Family SDK
+
   $root64 = Get-DotNetRoot x64
-  if ($need.Runtime.x64) { if (Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.NETCore.App")       $minKeepObj) { $folderCleanupFailures = $true } }
-  if ($need.AspNet.x64)  { if (Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.AspNetCore.App")     $minKeepObj) { $folderCleanupFailures = $true } }
-  if ($need.Desktop.x64) { if (Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.WindowsDesktop.App") $minKeepObj) { $folderCleanupFailures = $true } }
-  if ($need.SDK.x64)     { if (Remove-FolderIfBelowMin (Join-Path $root64 "sdk")                                  $minKeepObj) { $folderCleanupFailures = $true } }
+  if ($need.Runtime.x64) {
+    if (Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.NETCore.App") $minKeepObj) { $folderCleanupFailures = $true }
+    if (Remove-FolderIfBelowTargetLatest (Join-Path $root64 "shared\Microsoft.NETCore.App") $runtimeLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+    if (Remove-FolderIfBelowMin (Join-Path $root64 "host\fxr") $minKeepObj) { $folderCleanupFailures = $true }
+    if (Remove-FolderIfBelowTargetLatest (Join-Path $root64 "host\fxr") $runtimeLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+  }
+  if ($need.AspNet.x64)  {
+    if (Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.AspNetCore.App") $minKeepObj) { $folderCleanupFailures = $true }
+    if (Remove-FolderIfBelowTargetLatest (Join-Path $root64 "shared\Microsoft.AspNetCore.App") $aspNetLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+  }
+  if ($need.Desktop.x64) {
+    if (Remove-FolderIfBelowMin (Join-Path $root64 "shared\Microsoft.WindowsDesktop.App") $minKeepObj) { $folderCleanupFailures = $true }
+    if (Remove-FolderIfBelowTargetLatest (Join-Path $root64 "shared\Microsoft.WindowsDesktop.App") $desktopLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+  }
+  if ($need.SDK.x64)     {
+    if (Remove-FolderIfBelowMin (Join-Path $root64 "sdk") $minKeepObj) { $folderCleanupFailures = $true }
+    if (Remove-FolderIfBelowTargetLatest (Join-Path $root64 "sdk") $sdkLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+  }
 
   if ($IncludeX86) {
     $root86 = Get-DotNetRoot x86
-    if ($need.Runtime.x86) { if (Remove-FolderIfBelowMin (Join-Path $root86 "shared\Microsoft.NETCore.App")       $minKeepObj) { $folderCleanupFailures = $true } }
-    if ($need.AspNet.x86)  { if (Remove-FolderIfBelowMin (Join-Path $root86 "shared\Microsoft.AspNetCore.App")     $minKeepObj) { $folderCleanupFailures = $true } }
-    if ($need.Desktop.x86) { if (Remove-FolderIfBelowMin (Join-Path $root86 "shared\Microsoft.WindowsDesktop.App") $minKeepObj) { $folderCleanupFailures = $true } }
-    if ($need.SDK.x86)     { if (Remove-FolderIfBelowMin (Join-Path $root86 "sdk")                                  $minKeepObj) { $folderCleanupFailures = $true } }
+    if ($need.Runtime.x86) {
+      if (Remove-FolderIfBelowMin (Join-Path $root86 "shared\Microsoft.NETCore.App") $minKeepObj) { $folderCleanupFailures = $true }
+      if (Remove-FolderIfBelowTargetLatest (Join-Path $root86 "shared\Microsoft.NETCore.App") $runtimeLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+      if (Remove-FolderIfBelowMin (Join-Path $root86 "host\fxr") $minKeepObj) { $folderCleanupFailures = $true }
+      if (Remove-FolderIfBelowTargetLatest (Join-Path $root86 "host\fxr") $runtimeLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+    }
+    if ($need.AspNet.x86)  {
+      if (Remove-FolderIfBelowMin (Join-Path $root86 "shared\Microsoft.AspNetCore.App") $minKeepObj) { $folderCleanupFailures = $true }
+      if (Remove-FolderIfBelowTargetLatest (Join-Path $root86 "shared\Microsoft.AspNetCore.App") $aspNetLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+    }
+    if ($need.Desktop.x86) {
+      if (Remove-FolderIfBelowMin (Join-Path $root86 "shared\Microsoft.WindowsDesktop.App") $minKeepObj) { $folderCleanupFailures = $true }
+      if (Remove-FolderIfBelowTargetLatest (Join-Path $root86 "shared\Microsoft.WindowsDesktop.App") $desktopLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+    }
+    if ($need.SDK.x86)     {
+      if (Remove-FolderIfBelowMin (Join-Path $root86 "sdk") $minKeepObj) { $folderCleanupFailures = $true }
+      if (Remove-FolderIfBelowTargetLatest (Join-Path $root86 "sdk") $sdkLatestVersion $ch.ChannelVersion) { $folderCleanupFailures = $true }
+    }
   }
 
   Start-Sleep -Seconds 2
 
-  # Post-check: remaining below-min ARP
-  $after = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
+  # Post-check: remaining below-min and below-target-latest ARP
+  $afterBelowMin = @(Get-DotNetArpBelowMin -MinKeep $minKeepObj -IncludeX86:$IncludeX86)
+  $afterBelowTargetLatest = @(Get-DotNetArpBelowLatestForTarget -Latest $latest -TargetChannel $ch.ChannelVersion -IncludeX86:$IncludeX86)
+  $after = @(Get-UniqueArpItems (@($afterBelowMin) + @($afterBelowTargetLatest)))
   if ($rebootRequired) {
-    Write-Log ("Post-check: {0} below-min ARP item(s) still present, but at least one uninstall returned 3010. A reboot is required to complete removal." -f $after.Count)
+    Write-Log ("Post-check: {0} remediable ARP item(s) still present, but at least one uninstall returned 3010. A reboot is required to complete removal." -f $after.Count)
   }
   else {
-    Write-Log ("Post-check: Below-min (ARP, monitored .NET families) remaining: {0}" -f $after.Count)
+    Write-Log ("Post-check: Remediable ARP items remaining: {0} (below-min={1}, below-target-latest={2})" -f $after.Count, $afterBelowMin.Count, $afterBelowTargetLatest.Count)
   }
   foreach ($x in ($after | Sort-Object Family, Arch, Version)) {
-    Write-Log ("  Remaining below-min ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
+    Write-Log ("  Remaining remediable ARP: {0} {1} {2} :: {3}" -f $x.Family, $x.Arch, $x.Version, $x.Entry.DisplayName)
   }
 
   if ($folderCleanupFailures) {

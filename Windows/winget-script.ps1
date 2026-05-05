@@ -4,12 +4,12 @@
  Author: Peter James
 #>
 
-
 #Requires -Version 5.1
 [CmdletBinding()]
 param(
   [switch]$ReportOnly,
   [switch]$Install_Winget_if_Not_Avaialble,
+  [string]$ExcludedPackages,
   [string]$LogPath = "$env:ProgramData\Datto\Logs\Winget-UpgradeAll.log"
 )
 
@@ -21,7 +21,20 @@ $script:ErrorLines  = @()
 
 # ---------------- Datto env helpers ----------------
 function Get-Env([string]$Name) {
-  try { (Get-Item "Env:$Name" -ErrorAction SilentlyContinue).Value } catch { $null }
+  try { return [Environment]::GetEnvironmentVariable($Name, "Process") } catch { return $null }
+}
+
+function Get-EnvFirst {
+  param([string[]]$Names)
+
+  foreach ($name in $Names) {
+    $value = Get-Env $name
+    if (-not [string]::IsNullOrWhiteSpace($value)) {
+      return $value
+    }
+  }
+
+  return $null
 }
 
 function Get-EnvBool([string]$Name, [bool]$Default = $false) {
@@ -49,6 +62,15 @@ if (-not $PSBoundParameters.ContainsKey("ReportOnly")) {
 
 if (-not $PSBoundParameters.ContainsKey("Install_Winget_if_Not_Avaialble")) {
   $Install_Winget_if_Not_Avaialble = Get-EnvBool "Install_Winget_if_Not_Avaialble" $false
+}
+
+if (-not $PSBoundParameters.ContainsKey("ExcludedPackages")) {
+  $ExcludedPackages = Get-EnvFirst @(
+    "Excluded packaages",
+    "Excluded packages",
+    "ExcludedPackages",
+    "Excluded_Packages"
+  )
 }
 
 if (-not $PSBoundParameters.ContainsKey("LogPath")) {
@@ -217,10 +239,8 @@ function Test-IsSeparatorNoiseLine {
   $compact = ($Line -replace "\s", "")
   if ([string]::IsNullOrWhiteSpace($compact)) { return $false }
 
-  # Keep real table separators made of dashes because they make the output readable.
   if ($compact -match "^-{5,}$") { return $false }
 
-  # If there are no letters/numbers and the line is long, it is likely progress/bar noise.
   if ($compact.Length -gt 5 -and $compact -notmatch "[A-Za-z0-9]") {
     return $true
   }
@@ -311,9 +331,7 @@ function Get-UpgradeItemsFromWingetOutput {
     if ([string]::IsNullOrWhiteSpace($available)) { continue }
     if ([string]::IsNullOrWhiteSpace($source)) { continue }
 
-    # Source should normally be winget or msstore. This avoids parsing notices as package rows.
     if ($source -notmatch "^(winget|msstore)$") { continue }
-
     if ($id -eq "Id" -or $version -eq "Version" -or $available -eq "Available" -or $source -eq "Source") { continue }
 
     $already = @($items | Where-Object { $_.Id -ieq $id })
@@ -329,6 +347,82 @@ function Get-UpgradeItemsFromWingetOutput {
   }
 
   return @($items)
+}
+
+# ---------------- Exclusion helpers ----------------
+function Get-ExcludedPackageTokens {
+  param([string]$RawText)
+
+  if ([string]::IsNullOrWhiteSpace($RawText)) {
+    return @()
+  }
+
+  $tokens = @()
+
+  foreach ($part in ($RawText -split ",")) {
+    $token = $part.Trim()
+    $token = $token.Trim('"')
+    $token = $token.Trim("'")
+
+    if (-not [string]::IsNullOrWhiteSpace($token)) {
+      $tokens += $token
+    }
+  }
+
+  return @($tokens)
+}
+
+function Test-IsPackageExcluded {
+  param(
+    $Item,
+    [string[]]$Tokens
+  )
+
+  if ($null -eq $Item) { return $false }
+  if ($null -eq $Tokens -or $Tokens.Count -eq 0) { return $false }
+
+  foreach ($token in $Tokens) {
+    if ([string]::IsNullOrWhiteSpace($token)) { continue }
+
+    if ($token.Contains("*") -or $token.Contains("?")) {
+      if ($Item.Id -like $token) { return $true }
+      if ($Item.Name -like $token) { return $true }
+      continue
+    }
+
+    if ($Item.Id -ieq $token) { return $true }
+    if ($Item.Name -ieq $token) { return $true }
+
+    # Convenience matching for friendly names such as "Chrome" or "Office".
+    if ($token.Length -ge 3 -and $Item.Name -like ("*" + $token + "*")) {
+      return $true
+    }
+  }
+
+  return $false
+}
+
+function Split-ExcludedUpgradeItems {
+  param(
+    [object[]]$Items,
+    [string[]]$ExcludeTokens
+  )
+
+  $actionable = @()
+  $excluded = @()
+
+  foreach ($item in $Items) {
+    if (Test-IsPackageExcluded -Item $item -Tokens $ExcludeTokens) {
+      $excluded += $item
+    } else {
+      $actionable += $item
+    }
+  }
+
+  return [pscustomobject]@{
+    Actionable = @($actionable)
+    Excluded   = @($excluded)
+  }
 }
 
 function Format-UpgradeItems {
@@ -362,7 +456,7 @@ function Format-UpgradeItems {
       (Limit-Text $item.Source $sourceWidth))
   }
 
-  $lines += ("Total actionable upgradeable packages: {0}" -f $Items.Count)
+  $lines += ("Total packages: {0}" -f $Items.Count)
 
   return $lines
 }
@@ -551,9 +645,16 @@ function Install-WingetIfNeeded {
 
 # ---------------- Main ----------------
 try {
-  Add-Action "SCRIPT_VERSION=2026-04-27-WINGET-PER-PACKAGE-UPGRADE-v2"
-  Add-Action ("Resolved variables: ReportOnly=[{0}] Install_Winget_if_Not_Avaialble=[{1}] LogPath=[{2}]" -f `
-    [bool]$ReportOnly, [bool]$Install_Winget_if_Not_Avaialble, $LogPath)
+  Add-Action "SCRIPT_VERSION=2026-04-29-WINGET-PER-PACKAGE-UPGRADE-v3-EXCLUSIONS"
+  Add-Action ("Resolved variables: ReportOnly=[{0}] Install_Winget_if_Not_Avaialble=[{1}] ExcludedPackagesRaw=[{2}] LogPath=[{3}]" -f `
+    [bool]$ReportOnly, [bool]$Install_Winget_if_Not_Avaialble, $ExcludedPackages, $LogPath)
+
+  $excludeTokens = @(Get-ExcludedPackageTokens -RawText $ExcludedPackages)
+  if ($excludeTokens.Count -gt 0) {
+    Add-Action ("Excluded package tokens: {0}" -f ($excludeTokens -join ", "))
+  } else {
+    Add-Action "Excluded package tokens: [none]"
+  }
 
   $wingetPath = Install-WingetIfNeeded
   if ([string]::IsNullOrWhiteSpace($wingetPath)) {
@@ -588,19 +689,32 @@ try {
     Out-Result -Status "CompletedWithErrors" -Summary "winget pre-scan timed out." -ExitCode 1
   }
 
-  $upgradeItems = @(Get-UpgradeItemsFromWingetOutput -Content $combinedPreScan)
+  $allUpgradeItems = @(Get-UpgradeItemsFromWingetOutput -Content $combinedPreScan)
+  $splitItems = Split-ExcludedUpgradeItems -Items $allUpgradeItems -ExcludeTokens $excludeTokens
+  $upgradeItems = @($splitItems.Actionable)
+  $excludedItems = @($splitItems.Excluded)
 
-  Add-Action "Upgradeable packages detected by winget:"
-  Add-Action "BEGIN UPGRADEABLE PACKAGE LIST"
-  Add-ActionLines -Lines (Format-UpgradeItems -Items $upgradeItems)
-  Add-Action "END UPGRADEABLE PACKAGE LIST"
+  Add-Action "All upgradeable packages detected by winget:"
+  Add-Action "BEGIN ALL UPGRADEABLE PACKAGE LIST"
+  Add-ActionLines -Lines (Format-UpgradeItems -Items $allUpgradeItems)
+  Add-Action "END ALL UPGRADEABLE PACKAGE LIST"
+
+  Add-Action "Excluded packages that will NOT be upgraded:"
+  Add-Action "BEGIN EXCLUDED PACKAGE LIST"
+  Add-ActionLines -Lines (Format-UpgradeItems -Items $excludedItems -EmptyMessage "No excluded upgradeable packages matched.")
+  Add-Action "END EXCLUDED PACKAGE LIST"
+
+  Add-Action "Actionable packages that may be upgraded:"
+  Add-Action "BEGIN ACTIONABLE PACKAGE LIST"
+  Add-ActionLines -Lines (Format-UpgradeItems -Items $upgradeItems -EmptyMessage "No actionable upgradeable packages detected.")
+  Add-Action "END ACTIONABLE PACKAGE LIST"
 
   if ([bool]$ReportOnly) {
-    Out-Result -Status "ReportOnly" -Summary ("Report-only mode complete. Found {0} actionable upgradeable package(s)." -f $upgradeItems.Count) -ExitCode 0
+    Out-Result -Status "ReportOnly" -Summary ("Report-only complete. Actionable={0} Excluded={1} TotalDetected={2}." -f $upgradeItems.Count, $excludedItems.Count, $allUpgradeItems.Count) -ExitCode 0
   }
 
   if ($upgradeItems.Count -eq 0) {
-    Out-Result -Status "Success" -Summary "No upgradeable packages detected. Nothing to do." -ExitCode 0
+    Out-Result -Status "Success" -Summary ("No actionable upgradeable packages detected. Excluded={0} TotalDetected={1}." -f $excludedItems.Count, $allUpgradeItems.Count) -ExitCode 0
   }
 
   $packageResults = @()
@@ -668,12 +782,20 @@ try {
   Write-BlockToLog -Title "PostScan STDOUT" -Content $postScan.StdOut
   Write-BlockToLog -Title "PostScan STDERR" -Content $postScan.StdErr
 
-  $remainingItems = @(Get-UpgradeItemsFromWingetOutput -Content $combinedPostScan)
+  $remainingAllItems = @(Get-UpgradeItemsFromWingetOutput -Content $combinedPostScan)
+  $remainingSplitItems = Split-ExcludedUpgradeItems -Items $remainingAllItems -ExcludeTokens $excludeTokens
+  $remainingItems = @($remainingSplitItems.Actionable)
+  $remainingExcludedItems = @($remainingSplitItems.Excluded)
 
-  Add-Action "Post-upgrade remaining upgradeable packages:"
-  Add-Action "BEGIN REMAINING PACKAGE LIST"
+  Add-Action "Post-upgrade remaining actionable upgradeable packages:"
+  Add-Action "BEGIN REMAINING ACTIONABLE PACKAGE LIST"
   Add-ActionLines -Lines (Format-UpgradeItems -Items $remainingItems -EmptyMessage "No remaining actionable upgradeable packages detected.")
-  Add-Action "END REMAINING PACKAGE LIST"
+  Add-Action "END REMAINING ACTIONABLE PACKAGE LIST"
+
+  Add-Action "Post-upgrade remaining excluded upgradeable packages:"
+  Add-Action "BEGIN REMAINING EXCLUDED PACKAGE LIST"
+  Add-ActionLines -Lines (Format-UpgradeItems -Items $remainingExcludedItems -EmptyMessage "No remaining excluded upgradeable packages detected.")
+  Add-Action "END REMAINING EXCLUDED PACKAGE LIST"
 
   $failedCount = 0
   $stillUpgradeableCount = 0
@@ -713,7 +835,7 @@ try {
 
   Add-Action "END PACKAGE RESULT SUMMARY"
 
-  $summary = "Attempted=$($packageResults.Count) Success=$successCount Failed=$failedCount StillUpgradeable=$stillUpgradeableCount Remaining=$($remainingItems.Count)"
+  $summary = "Attempted=$($packageResults.Count) Success=$successCount Failed=$failedCount StillUpgradeable=$stillUpgradeableCount Excluded=$($excludedItems.Count) RemainingActionable=$($remainingItems.Count) RemainingExcluded=$($remainingExcludedItems.Count)"
 
   if ($failedCount -gt 0 -or $stillUpgradeableCount -gt 0) {
     Out-Result -Status "CompletedWithErrors" -Summary $summary -ExitCode 1

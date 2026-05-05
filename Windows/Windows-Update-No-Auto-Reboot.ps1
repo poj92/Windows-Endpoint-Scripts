@@ -14,6 +14,12 @@ Behavior:
   3) Fallback to schtasks /IT
   4) Final fallback is msg.exe only (never reboots)
 
+Reboot detection:
+- Strict reboot detection is used for prompting:
+  * CBS RebootPending
+  * Windows Update Auto Update\RebootRequired
+- PendingFileRenameOperations is logged for diagnostics only and does NOT trigger the prompt.
+
 Exit codes:
   0 = no reboot needed; updates installed or none available
   1 = reboot required/pending; prompt launched or scheduled (no forced reboot)
@@ -35,6 +41,9 @@ param(
   [switch]$ReportOnly,
 
   [int]$PostRebootMaxPasses = 4,
+
+  [switch]$VerboseLogging,
+  [int]$UiLaunchConfirmSeconds = 8,
 
   [string]$UiTitle = "A security message from Nexus Open Systems Ltd",
   [string]$Reason  = "Windows updates require a restart to finish installing. Please plug your computer into power if it's not already, save your work, and restart as soon as possible to ensure your system is secure and up to date.",
@@ -61,6 +70,7 @@ $StatePath          = Join-Path $BaseDir "WU-State.json"
 $UiHelperPath       = Join-Path $BaseDir "RebootPromptUI.ps1"
 $UiWrapperPath      = Join-Path $BaseDir "RunRebootPrompt.cmd"
 $MainScriptCopyPath = Join-Path $BaseDir "Windows-Update-No-Auto-Reboot.ps1"
+$UiSignalPath       = Join-Path $BaseDir "WU-UI-Signal.json"
 
 $TaskPostBoot       = "Nexus_WU_PostBootWorker"
 $TaskReminder       = "Nexus_WU_RebootReminder"
@@ -73,6 +83,8 @@ function Write-Log {
     [ValidateSet('INFO','WARN','ERROR','DEBUG')]
     [string]$Level = 'INFO'
   )
+
+  if ($Level -eq 'DEBUG' -and -not $VerboseLogging) { return }
 
   $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
   $line = "[{0}] [{1}] {2}" -f $ts, $Level, $Message
@@ -127,22 +139,60 @@ function Get-CurrentIdentityName {
   }
 }
 
-function Test-PendingReboot {
-  $paths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-  )
-  foreach ($p in $paths) {
-    if (Test-Path $p) { return $true }
-  }
+function Get-PendingRebootDetails {
+  $cbsRebootPending = $false
+  $wuRebootRequired = $false
+  $pendingRenameOps = $false
+  $pendingRenameOpsCount = 0
+
+  try {
+    $cbsRebootPending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+  } catch { }
+
+  try {
+    $wuRebootRequired = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+  } catch { }
 
   try {
     $sess = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
       -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-    if ($sess -and $sess.PendingFileRenameOperations) { return $true }
+
+    if ($sess -and $sess.PendingFileRenameOperations) {
+      $pendingRenameOps = $true
+      try { $pendingRenameOpsCount = @($sess.PendingFileRenameOperations).Count } catch { $pendingRenameOpsCount = 1 }
+    }
   } catch { }
 
-  return $false
+  [pscustomobject]@{
+    CBSRebootPending      = [bool]$cbsRebootPending
+    WURebootRequired      = [bool]$wuRebootRequired
+    PendingRenameOps      = [bool]$pendingRenameOps
+    PendingRenameOpsCount = [int]$pendingRenameOpsCount
+    IsPendingStrict       = [bool]($cbsRebootPending -or $wuRebootRequired)
+    IsPendingConservative = [bool]($cbsRebootPending -or $wuRebootRequired -or $pendingRenameOps)
+  }
+}
+
+function Test-PendingReboot {
+  param([switch]$Conservative)
+
+  $d = Get-PendingRebootDetails
+  if ($Conservative) { return $d.IsPendingConservative }
+  return $d.IsPendingStrict
+}
+
+function Write-PendingRebootLog {
+  param([string]$Prefix = 'PENDING_REBOOT')
+
+  $d = Get-PendingRebootDetails
+  Write-Log ("{0}: CBSRebootPending={1}; WURebootRequired={2}; PendingRenameOps={3}; PendingRenameOpsCount={4}; StrictPending={5}; ConservativePending={6}" -f `
+    $Prefix,
+    $d.CBSRebootPending,
+    $d.WURebootRequired,
+    $d.PendingRenameOps,
+    $d.PendingRenameOpsCount,
+    $d.IsPendingStrict,
+    $d.IsPendingConservative)
 }
 
 function Get-ActiveSessionPresent {
@@ -336,6 +386,41 @@ function Ensure-MainScriptCopy {
     Write-ExceptionLog -Prefix 'Ensure-MainScriptCopy failed' -ErrorRecord $_
   }
   return $MainScriptCopyPath
+}
+
+function Clear-UiSignal {
+  try {
+    if (Test-Path $UiSignalPath) {
+      Remove-Item $UiSignalPath -Force -ErrorAction SilentlyContinue
+    }
+  } catch { }
+}
+
+function Get-UiSignal {
+  try {
+    if (Test-Path $UiSignalPath) {
+      return Get-Content $UiSignalPath -Raw | ConvertFrom-Json
+    }
+  } catch { }
+  return $null
+}
+
+function Wait-ForUiSignal {
+  param(
+    [string[]]$Stages = @('START','SHOWN'),
+    [int]$TimeoutSeconds = 8
+  )
+
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  do {
+    $sig = Get-UiSignal
+    if ($sig -and $Stages -contains [string]$sig.Stage) {
+      return $sig
+    }
+    Start-Sleep -Milliseconds 500
+  } while ((Get-Date) -lt $deadline)
+
+  return $null
 }
 
 $script:LauncherLoaded = $false
@@ -565,6 +650,8 @@ function Write-UiHelperScript {
   $optsCsv = ($PostponeOptionsMinutes | ForEach-Object { [int]$_ }) -join ','
   $mainScriptPathForReminder = $MainScriptCopyPath
   $baseDirForHelper = $BaseDir
+  $uiSignalPathForHelper = $UiSignalPath
+  $verboseLiteral = if ($VerboseLogging) { '$true' } else { '$false' }
 
   $content = @"
 param(
@@ -585,7 +672,11 @@ $mainScriptPathForReminder
 '@,
   [string]`$BaseDir = @'
 $baseDirForHelper
-'@
+'@,
+  [string]`$UiSignalPath = @'
+$uiSignalPathForHelper
+'@,
+  [bool]`$VerboseLogging = $verboseLiteral
 )
 
 Set-StrictMode -Off
@@ -597,6 +688,7 @@ function Write-LogLocal {
     [ValidateSet('INFO','WARN','ERROR','DEBUG')]
     [string]`$Level = 'INFO'
   )
+  if (`$Level -eq 'DEBUG' -and -not `$VerboseLogging) { return }
   try {
     `$ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     Add-Content -Path `$LogPath -Value ("[{0}] [{1}] {2}" -f `$ts, `$Level, `$Message) -Encoding UTF8
@@ -624,6 +716,22 @@ function Write-ExceptionLocal {
   }
 }
 
+function Set-UiSignal {
+  param([string]`$Stage)
+
+  try {
+    `$obj = [ordered]@{
+      Stage     = `$Stage
+      Time      = (Get-Date).ToString('s')
+      Identity  = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+      SessionId = [System.Diagnostics.Process]::GetCurrentProcess().SessionId
+      PID       = `$PID
+      Machine   = `$env:COMPUTERNAME
+    }
+    (`$obj | ConvertTo-Json -Depth 3) | Set-Content -Path `$UiSignalPath -Encoding UTF8 -Force
+  } catch { }
+}
+
 function Get-CurrentIdentityName {
   try {
     return [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -636,19 +744,18 @@ function Get-CurrentIdentityName {
 }
 
 function Test-PendingReboot {
-  `$paths = @(
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
-    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
-  )
-  foreach (`$p in `$paths) {
-    if (Test-Path `$p) { return `$true }
-  }
+  `$cbsRebootPending = `$false
+  `$wuRebootRequired = `$false
+
   try {
-    `$sess = Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' `
-      -Name 'PendingFileRenameOperations' -ErrorAction SilentlyContinue
-    if (`$sess -and `$sess.PendingFileRenameOperations) { return `$true }
+    `$cbsRebootPending = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
   } catch { }
-  return `$false
+
+  try {
+    `$wuRebootRequired = Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+  } catch { }
+
+  return [bool](`$cbsRebootPending -or `$wuRebootRequired)
 }
 
 function Remove-ReminderTask {
@@ -699,8 +806,10 @@ function Schedule-Reminder([datetime]`$When) {
 
     if (`$isSystem) {
       `$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+      Write-LogLocal "UI: scheduling reminder as SYSTEM." 'INFO'
     } else {
       `$principal = New-ScheduledTaskPrincipal -UserId `$currentIdentity -LogonType Interactive -RunLevel Limited
+      Write-LogLocal ("UI: scheduling reminder as interactive user '{0}'." -f `$currentIdentity) 'INFO'
     }
 
     `$action = New-ScheduledTaskAction -Execute `$psExe -Argument `$arg
@@ -725,6 +834,7 @@ try {
     [System.Diagnostics.Process]::GetCurrentProcess().SessionId,
     `$PID,
     `$env:COMPUTERNAME)
+  Set-UiSignal 'START'
 
   Add-Type -AssemblyName System.Windows.Forms
   Add-Type -AssemblyName System.Drawing
@@ -732,6 +842,7 @@ try {
 
   if (-not (Test-PendingReboot)) {
     Write-LogLocal "UI: reboot not required; exiting."
+    Set-UiSignal 'EXIT_NO_REBOOT_REQUIRED'
     Remove-ReminderTask
     exit 0
   }
@@ -745,8 +856,6 @@ try {
   if (-not `$PostponeOptionsMinutes -or `$PostponeOptionsMinutes.Count -eq 0) {
     `$PostponeOptionsMinutes = @(30,60,120)
   }
-
-  Write-LogLocal ("UI_SHOWN: CountdownMinutes='{0}'; Options='{1}'" -f `$CountdownMinutes, (`$PostponeOptionsMinutes -join ','))
 
   `$script:AllowClose = `$false
   `$script:deadlineInfoOnly = (Get-Date).AddMinutes([double]`$CountdownMinutes)
@@ -763,6 +872,10 @@ try {
     if (-not `$script:AllowClose -and `$_.CloseReason -eq [System.Windows.Forms.CloseReason]::UserClosing) {
       `$_.Cancel = `$true
     }
+  })
+  `$form.Add_Shown({
+    Write-LogLocal "UI_SHOWN"
+    Set-UiSignal 'SHOWN'
   })
 
   `$label1 = New-Object System.Windows.Forms.Label
@@ -830,6 +943,7 @@ try {
     `$when = (Get-Date).AddMinutes([double]`$mins)
     if (Schedule-Reminder -When `$when) {
       Write-LogLocal ("USER_ACTION: Postpone {0} minutes (re-prompt at {1})" -f `$mins, `$when.ToString('yyyy-MM-dd HH:mm:ss'))
+      Set-UiSignal 'POSTPONED'
       `$label3.Text = ('Okay — we will remind you again at {0}.' -f `$when.ToString('HH:mm'))
       Start-Sleep -Milliseconds 800
       `$script:AllowClose = `$true
@@ -847,6 +961,7 @@ try {
   `$btnNow.Location = New-Object System.Drawing.Point(570, 160)
   `$btnNow.Add_Click({
     Write-LogLocal "USER_ACTION: Reboot now"
+    Set-UiSignal 'REBOOT_NOW'
     `$script:AllowClose = `$true
     try { & shutdown.exe /r /t 0 /c "`$Reason" | Out-Null } catch {
       Write-ExceptionLocal -Prefix 'UI_SHUTDOWN_ERROR' -ErrorRecord `$_
@@ -895,13 +1010,18 @@ function Launch-UiInActiveSessionNow {
   $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
   $cmdLine = Get-UiCommandLine
 
-  Write-Log ("Immediate UI launch attempt. Identity='{0}'; CommandLine={1}" -f $currentIdentity, $cmdLine) 'DEBUG'
+  Write-Log ("UI launch attempt: Identity='{0}'" -f $currentIdentity)
+  Clear-UiSignal
 
   if (-not $isSystem) {
     try {
       Start-Process -FilePath $psExe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$UiHelperPath`" -CountdownMinutes $CountdownMinutes" -WindowStyle Hidden
-      Write-Log "Immediate UI launched directly because script is already running in user context."
-      return
+      $sig = Wait-ForUiSignal -TimeoutSeconds $UiLaunchConfirmSeconds
+      if ($sig) {
+        Write-Log ("UI helper confirmed: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
+        return
+      }
+      Write-Log "Direct user-context launch did not confirm UI startup." 'WARN'
     } catch {
       Write-ExceptionLog -Prefix 'Immediate UI direct launch failed' -ErrorRecord $_
     }
@@ -912,10 +1032,14 @@ function Launch-UiInActiveSessionNow {
       $err = 0
       $ok = [NexusSessionLauncher]::StartAsSystemInActiveSession($psExe, $cmdLine, [ref]$err)
       if ($ok) {
-        Write-Log "Immediate UI launched via SessionLauncher."
-        return
+        $sig = Wait-ForUiSignal -TimeoutSeconds $UiLaunchConfirmSeconds
+        if ($sig) {
+          Write-Log ("UI helper confirmed after SessionLauncher: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
+          return
+        }
+        Write-Log "SessionLauncher returned success, but UI helper did not confirm startup." 'WARN'
       } else {
-        Write-Log ("Immediate UI SessionLauncher failed. Win32Error={0}" -f $err) 'WARN'
+        Write-Log ("SessionLauncher failed. Win32Error={0}" -f $err) 'WARN'
       }
     } catch {
       Write-ExceptionLog -Prefix 'Immediate UI SessionLauncher failed' -ErrorRecord $_
@@ -929,19 +1053,24 @@ function Launch-UiInActiveSessionNow {
     $st = $start.ToString('HH:mm')
 
     Remove-Task $TaskImmediate
-    $createOut = & schtasks.exe /Create /TN $TaskImmediate /TR "`"$UiWrapperPath`"" /SC ONCE /SD $sd /ST $st /RU $currentIdentity /RL LIMITED /IT /F 2>&1
-    Write-Log ("IMMEDIATE schtasks /Create output: {0}" -f (($createOut | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
+    if ($isSystem) {
+      $createOut = & schtasks.exe /Create /TN $TaskImmediate /TR "`"$UiWrapperPath`"" /SC ONCE /SD $sd /ST $st /RU SYSTEM /RL HIGHEST /IT /F 2>&1
+    } else {
+      $createOut = & schtasks.exe /Create /TN $TaskImmediate /TR "`"$UiWrapperPath`"" /SC ONCE /SD $sd /ST $st /RU $currentIdentity /RL LIMITED /IT /F 2>&1
+    }
+    Write-Log ("Immediate fallback task create: {0}" -f (($createOut | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
 
     if ($LASTEXITCODE -eq 0) {
-      Write-TaskDiagnostics -TaskName $TaskImmediate -Prefix 'IMMEDIATE_TASK_BEFORE_RUN'
       $runOut = & schtasks.exe /Run /TN $TaskImmediate 2>&1
-      Write-Log ("IMMEDIATE schtasks /Run output: {0}" -f (($runOut | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
+      Write-Log ("Immediate fallback task run: {0}" -f (($runOut | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
 
       if ($LASTEXITCODE -eq 0) {
-        Write-Log ("Attempted immediate UI launch via schtasks.exe /Run as '{0}'." -f $currentIdentity)
-        Start-Sleep -Seconds 2
-        Write-TaskDiagnostics -TaskName $TaskImmediate -Prefix 'IMMEDIATE_TASK_AFTER_RUN'
-        return
+        $sig = Wait-ForUiSignal -TimeoutSeconds $UiLaunchConfirmSeconds
+        if ($sig) {
+          Write-Log ("UI helper confirmed after scheduled-task fallback: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
+          return
+        }
+        Write-Log "Scheduled-task fallback ran, but UI helper did not confirm startup." 'WARN'
       }
     }
   } catch {
@@ -949,7 +1078,7 @@ function Launch-UiInActiveSessionNow {
   }
 
   Send-UserMessage "Windows updates require a restart. Please save your work and reboot when ready."
-  Write-Log "Immediate UI final fallback was msg.exe only (no reboot)." 'WARN'
+  Write-Log "Final fallback used msg.exe only (no reboot)." 'WARN'
 }
 
 function Register-LogonPromptTask {
@@ -1163,12 +1292,12 @@ function Register-PostBootWorkerTask {
   $settings  = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 
   Register-ScheduledTask -TaskName $TaskPostBoot -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-  Write-Log "Registered post-boot Windows Update worker task (runs at startup as SYSTEM)."
+  Write-Log "Registered post-boot Windows Update worker task."
   Write-TaskDiagnostics -TaskName $TaskPostBoot -Prefix 'POSTBOOT_TASK'
 }
 
 function Run-PostBootWorker {
-  Write-Log ("POSTBOOT: Starting Windows Update worker. Identity='{0}'; PSVersion='{1}'" -f `
+  Write-Log ("POSTBOOT: Starting worker. Identity='{0}'; PSVersion='{1}'" -f `
     (Get-CurrentIdentityName), $PSVersionTable.PSVersion)
 
   $pass = 0
@@ -1207,14 +1336,15 @@ function Run-PostBootWorker {
   }
 
   $pending = Test-PendingReboot
+  Write-PendingRebootLog -Prefix 'POSTBOOT_PENDING_STATE'
   Write-Log ("POSTBOOT: InstalledTotal={0} RebootFromInstall={1} PendingReboot={2}" -f $installedTotal, $rebootFromInstall, $pending)
   Write-LatestInstalledUpdateLog -Prefix 'POSTBOOT_LATEST_INSTALLED_UPDATE'
 
   if ($pending -or $rebootFromInstall) {
-    Write-Log "POSTBOOT: Reboot required. Keeping ONLOGON prompt task."
+    Write-Log "POSTBOOT: Reboot still required. Keeping ONLOGON prompt task."
   } else {
     Remove-Task $TaskOnLogon
-    Write-Log "POSTBOOT: System is clean. Removed ONLOGON prompt task."
+    Write-Log "POSTBOOT: System clean. Removed ONLOGON prompt task."
   }
 
   Remove-Task $TaskPostBoot
@@ -1224,14 +1354,14 @@ function Run-PostBootWorker {
 try {
   Ensure-BaseDirPermissions
 
-  Write-Host "Windows Update (Consent-only + auto re-run + proven active-session UI launch; prompt only if reboot required)"
-  Write-Log ("Script start: Mode='{0}'; Identity='{1}'; Computer='{2}'; PSVersion='{3}'; IncludeRebootUpdates='{4}'; EnsureLatestCumulativeUpdate='{5}'; ReportOnly='{6}'; CountdownMinutes='{7}'" -f `
-    $Mode, (Get-CurrentIdentityName), $env:COMPUTERNAME, $PSVersionTable.PSVersion, [bool]$IncludeRebootUpdates, $EnsureLatestCumulativeUpdate, [bool]$ReportOnly, $CountdownMinutes)
+  Write-Host "Windows Update (Consent-only + auto re-run + verified UI launch; prompt only if reboot required)"
+  Write-Log ("Script start: Mode='{0}'; Identity='{1}'; Computer='{2}'; PSVersion='{3}'; IncludeRebootUpdates='{4}'; EnsureLatestCumulativeUpdate='{5}'; ReportOnly='{6}'; CountdownMinutes='{7}'; VerboseLogging='{8}'" -f `
+    $Mode, (Get-CurrentIdentityName), $env:COMPUTERNAME, $PSVersionTable.PSVersion, [bool]$IncludeRebootUpdates, $EnsureLatestCumulativeUpdate, [bool]$ReportOnly, $CountdownMinutes, [bool]$VerboseLogging)
 
   $os = Get-OsBuildInfo
   if ($os) { Write-Log ("OS_BUILD_INFO: {0}" -f $os) }
 
-  if (-not (Test-IsAdmin)) {
+  if ($Mode -ne 'PromptOnly' -and -not (Test-IsAdmin)) {
     throw "Run this script elevated (Administrator / SYSTEM)."
   }
 
@@ -1258,8 +1388,17 @@ try {
 
   if ($ReportOnly) {
     Write-Log "ReportOnly=True. Scan-only mode; no installs will be attempted."
+    Write-PendingRebootLog -Prefix 'REPORTONLY_PENDING_STATE'
+
     $beforePending = Test-PendingReboot
-    if ($beforePending) { Write-Log "ReportOnly: System already indicates a pending reboot." }
+    if ($beforePending) {
+      Write-Log "ReportOnly: strict Windows Update / servicing pending reboot is set."
+    } else {
+      $conservativePending = Test-PendingReboot -Conservative
+      if ($conservativePending) {
+        Write-Log "ReportOnly: non-Windows-Update reboot indicators exist, but strict Windows Update reboot state is not set." 'WARN'
+      }
+    }
 
     $scan = Get-AvailableUpdates
     $updates = @($scan.Updates)
@@ -1287,11 +1426,21 @@ try {
   Register-LogonPromptTask
 
   Write-Log "Pre-reboot phase: scanning/installing updates..."
+  Write-PendingRebootLog -Prefix 'PREBOOT_PENDING_STATE_BEFORE'
   $beforePending = Test-PendingReboot
-  if ($beforePending) { Write-Log "System already indicates a pending reboot." }
+
+  if ($beforePending) {
+    Write-Log "System indicates a Windows Update / servicing pending reboot."
+  } else {
+    $conservativeBefore = Test-PendingReboot -Conservative
+    if ($conservativeBefore) {
+      Write-Log "Non-Windows-Update reboot indicators exist (for example PendingFileRenameOperations), but strict Windows Update reboot state is not set." 'WARN'
+    }
+  }
 
   $result = Run-WindowsUpdatePasses -MaxPasses 3 -IncludeRebootUpdates:$IncludeRebootUpdates -EnsureLatestCumulativeUpdate:$EnsureLatestCumulativeUpdate
 
+  Write-PendingRebootLog -Prefix 'PREBOOT_PENDING_STATE_AFTER'
   $afterPending = Test-PendingReboot
   $needsReboot = $beforePending -or $afterPending -or $result.RebootFromInstall
 
