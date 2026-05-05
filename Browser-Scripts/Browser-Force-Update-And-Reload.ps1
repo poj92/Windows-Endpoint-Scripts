@@ -1,21 +1,29 @@
 #Requires -Version 5.1
+
 <#
-    Browser-Force-Update-And-Reload.ps1
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
 
-    Purpose
-    - Force Google Chrome and Microsoft Edge to check/apply updates immediately.
-    - If a browser relaunch is required, prompt the logged-in user with only one action: Reload now.
-    - If the user does nothing, reload automatically after the countdown expires.
+<#
+        Browser-Force-Update-And-Reload.ps1
 
-    Recommended Datto RMM execution context
-    - Run as SYSTEM.
-      The script will perform the update work in SYSTEM context and, if needed, create a one-time
-      scheduled task to show the popup in the logged-in user's session.
+        Purpose
+        - Force Google Chrome and Microsoft Edge to check/apply updates immediately.
+        - If a browser relaunch is required, prompt the logged-in user with only one action: Reload now.
+        - If the user does nothing, reload automatically after the countdown expires.
 
-    Notes
-    - Browsers are only relaunched if they were running when the reload phase starts.
-    - Existing tabs/sessions rely on Chrome/Edge session restore/user settings.
-    - The script uses multiple update triggers because endpoint builds vary.
+        Recommended Datto RMM execution context
+        - Run as SYSTEM.
+            The script will perform the update work in SYSTEM context and, if needed, create a one-time
+            scheduled task to show the popup in the logged-in user's session.
+
+        Notes
+        - Browsers are only relaunched if they were running when the reload phase starts.
+        - Existing tabs/sessions rely on Chrome/Edge session restore/user settings.
+        - The script uses multiple update triggers because endpoint builds vary.
 #>
 
 param(

@@ -1,6 +1,13 @@
 #Requires -Version 5.1
 
 <#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
+<#
     Author: Peter Opeyemi James
 
     When deploying this script, it must be run in the context of the logged-in user.

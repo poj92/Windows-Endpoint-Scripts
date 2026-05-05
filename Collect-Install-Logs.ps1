@@ -1,3 +1,11 @@
+#Author header added
+<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
 # Number of hours to look back
 # Example: 24 = last 24 hours, 48 = last 48 hours
 # Set Datto variable StartTime

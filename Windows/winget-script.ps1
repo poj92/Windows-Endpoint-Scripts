@@ -1,7 +1,12 @@
+[<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>]
+
 <#
  Winget Script to auto upgrade packages where possible
- V1.3
- Author: Peter James
 #>
 
 #Requires -Version 5.1

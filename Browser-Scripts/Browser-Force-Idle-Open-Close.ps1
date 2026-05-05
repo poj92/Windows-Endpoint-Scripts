@@ -3,6 +3,34 @@
 Browser-Force-Open-Close.ps1 (SAFE PER-BROWSER)
 
 Goal:
+  - If the browser is currently running (any instance): DO NOT TOUCH IT (no launch/no close).
+  - Else, decide if it was opened within the last N hours.
+  - If not opened, launch it, keep open for OpenSeconds, then close ONLY the instance we started.
+
+Signals (when NOT running):
+
+Safety:
+
+Exit codes:
+  0 = no action needed (or all candidates already running / within window)
+  1 = at least one browser was launched+closed by this script
+  2 = ReportOnly and at least one browser would be launched
+  3 = no supported browsers installed
+  4 = error
+#>
+#Requires -Version 5.1
+
+<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
+<#
+Browser-Force-Open-Close.ps1 (SAFE PER-BROWSER)
+
+Goal:
 - For EACH installed browser:
   - If the browser is currently running (any instance): DO NOT TOUCH IT (no launch/no close).
   - Else, decide if it was opened within the last N hours.
@@ -18,9 +46,6 @@ Safety:
 Exit codes:
   0 = no action needed (or all candidates already running / within window)
   1 = at least one browser was launched+closed by this script
-  2 = ReportOnly and at least one browser would be launched
-  3 = no supported browsers installed
-  4 = error
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]

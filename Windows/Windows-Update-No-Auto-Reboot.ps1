@@ -1,4 +1,12 @@
 #Requires -Version 5.1
+
+<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
 <#
 Windows Update + Consent-only Reboot + Auto Post-boot Update + Auto Re-prompt
 

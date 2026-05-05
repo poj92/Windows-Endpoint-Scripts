@@ -1,4 +1,12 @@
 #Requires -Version 5.1
+
+<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
 <#
 DotNet-MinKeep-ConditionalInstall-Cleanup.ps1 (CORRECTED)
 
@@ -18,7 +26,7 @@ Behavior:
 - Treats MSI exit codes 0 / 1605 / 1614 / 3010 as OK.
 - Tracks 3010 as reboot-required, but does not force restart.
 - Performs aggressive folder cleanup (best-effort) for x64 and optionally x86,
-  including host\fxr cleanup when Runtime is remediated.
+  including host\\fxr cleanup when Runtime is remediated.
 - Post-check logs any remaining below-min or below-target-latest ARP items.
 
 Datto RMM env vars:
@@ -34,6 +42,7 @@ Exit codes:
   0 = success / no action / report only
   3 = error
 #>
+
 
 [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(

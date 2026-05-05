@@ -1,4 +1,12 @@
 #Requires -Version 5.1
+
+<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
 <#
 - Installs all available updates that do NOT require reboot (RebootBehavior=NeverReboots)
 - If reboot is required (pending reboot OR updates requiring reboot OR install reports reboot):

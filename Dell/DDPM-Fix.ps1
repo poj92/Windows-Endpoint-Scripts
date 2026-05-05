@@ -1,3 +1,10 @@
+#<#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
 <#
 Detects and remediates vulnerable Dell Peripheral Manager / Dell Display and Peripheral Manager 
 installs on Dell systems. The component skips non-Dell devices by default, removes any DPM/DDPM 

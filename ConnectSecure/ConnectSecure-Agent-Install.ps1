@@ -1,4 +1,11 @@
 <#
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
+<#
 This script is built towork with Datto RMM variables.
 
 In the component editor, go to Variables and add:
