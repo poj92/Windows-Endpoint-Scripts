@@ -3,7 +3,7 @@
 <#
 Author: Peter Opeyemi James
 Company: Nexus Open Systems Ltd
-Date: 2026-06-01
+Date: 2026-05-05
 Email: Peter.James@nexusos.co.uk
 #>
 
@@ -76,6 +76,22 @@ function Format-HourValue {
     return $Hours.ToString("0.##", [System.Globalization.CultureInfo]::InvariantCulture)
 }
 
+function Resolve-BoolSetting {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][bool]$DefaultValue
+    )
+
+    $rawValue = [Environment]::GetEnvironmentVariable($Name)
+    if ([string]::IsNullOrWhiteSpace($rawValue)) { return $DefaultValue }
+
+    switch -Regex (($rawValue.Trim()).ToLowerInvariant()) {
+        '^(1|true|yes|y|on)$' { return $true }
+        '^(0|false|no|n|off)$' { return $false }
+        default { return $DefaultValue }
+    }
+}
+
 # =========================
 # Configuration
 # =========================
@@ -92,6 +108,10 @@ $BrowserRunningWindowHoursText = Format-HourValue -Hours $BrowserRunningWindowHo
 $BrowserInactiveWindowHoursText = Format-HourValue -Hours $BrowserInactiveWindowHours
 
 $ApiTimeoutSeconds = 20
+
+# v4 default queues closed browsers that are behind latest even when no staged/pending update is detected.
+# The closed-browser worker will make a bounded best-effort update-page attempt without downloading installers.
+$QueueClosedOutOfDateWithoutPendingUpdate = Resolve-BoolSetting -Name 'QueueClosedOutOfDateWithoutPendingUpdate' -DefaultValue $true
 
 # Chrome latest-version policy:
 #   GeneralStable (default) = use the latest non-early-stable desktop stable release from Chrome Releases.
@@ -1215,6 +1235,7 @@ try {
     Write-LogEntry "Browser reload detection started"
     Write-LogEntry "Running window set to $BrowserRunningWindowHoursText hours via $($BrowserRunningWindowSetting.Source)"
     Write-LogEntry "Inactive window set to $BrowserInactiveWindowHoursText hours via $($BrowserInactiveWindowSetting.Source)"
+    Write-LogEntry "QueueClosedOutOfDateWithoutPendingUpdate=$QueueClosedOutOfDateWithoutPendingUpdate. If True, closed browsers behind latest are queued even when PendingUpdate=False for bounded best-effort update-page processing."
 
     if ($BrowserRunningWindowSetting.Warning) {
         Write-LogEntry $BrowserRunningWindowSetting.Warning "Warning"
@@ -1247,19 +1268,31 @@ try {
         $stateInfo = Get-BrowserStateInfo -BrowserName $browser -TrackingData $tracking -RunningThresholdHours $BrowserRunningWindowHours -InactiveThresholdHours $BrowserInactiveWindowHours
         $versionStatus = Get-BrowserVersionStatus -BrowserName $browser
 
-        if (-not $stateInfo.IsRunning -and ($versionStatus.PendingUpdate -or $versionStatus.OutOfDate -eq $true)) {
+        if (-not $stateInfo.IsRunning) {
             $immediateReasonParts = @()
+            $allowImmediateClosedQueue = $false
+
             if ($versionStatus.PendingUpdate) {
+                $allowImmediateClosedQueue = $true
                 $immediateReasonParts += "pending update"
             }
+
             if ($versionStatus.OutOfDate -eq $true) {
-                $immediateReasonParts += "out of date"
+                if ($QueueClosedOutOfDateWithoutPendingUpdate -or $versionStatus.PendingUpdate) {
+                    $allowImmediateClosedQueue = $true
+                    $immediateReasonParts += "out of date"
+                }
+                else {
+                    Write-LogEntry "$browser is closed and is out of date, but PendingUpdate=False. Not queuing for the open/update/close worker because no staged/pending browser update was detected. Set QueueClosedOutOfDateWithoutPendingUpdate=True to attempt anyway." "Warning"
+                }
             }
 
-            $immediateReason = "Browser is closed and is " + ($immediateReasonParts -join " and ") + "; queued immediately for open/update/close cycle"
-            Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $immediateReason -RemediationMode "ClosedUpdateCycle" -VersionStatus $versionStatus
-            Write-LogEntry "$browser is closed and is $($immediateReasonParts -join ' and '). Inactive window threshold is bypassed for immediate treatment."
-            continue
+            if ($allowImmediateClosedQueue) {
+                $immediateReason = "Browser is closed and is " + ($immediateReasonParts -join " and ") + "; queued immediately for open/update/close cycle"
+                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $immediateReason -RemediationMode "ClosedUpdateCycle" -VersionStatus $versionStatus
+                Write-LogEntry "$browser is closed and is $($immediateReasonParts -join ' and '). Inactive window threshold is bypassed for immediate treatment."
+                continue
+            }
         }
 
         if (-not $stateInfo.ThresholdMet) {
@@ -1290,8 +1323,13 @@ try {
             }
 
             if ($versionStatus.OutOfDate -eq $true) {
-                $needsClosedUpdateCycle = $true
-                $reasonParts += "out of date"
+                if ($QueueClosedOutOfDateWithoutPendingUpdate -or $versionStatus.PendingUpdate) {
+                    $needsClosedUpdateCycle = $true
+                    $reasonParts += "out of date"
+                }
+                else {
+                    Write-LogEntry "$browser has not been used for $BrowserInactiveWindowHoursText+ hours and is out of date, but PendingUpdate=False. Not queuing for open/update/close because no staged/pending browser update was detected." "Warning"
+                }
             }
 
             if ($needsClosedUpdateCycle) {
@@ -1299,7 +1337,7 @@ try {
                 Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $reason -RemediationMode "ClosedUpdateCycle" -VersionStatus $versionStatus
             }
             else {
-                Write-LogEntry "$browser has not been used for $BrowserInactiveWindowHoursText+ hours, but no pending update or confirmed out-of-date version was detected"
+                Write-LogEntry "$browser has not been used for $BrowserInactiveWindowHoursText+ hours, but no pending update was detected, or out-of-date-without-pending was intentionally not queued"
             }
         }
     }

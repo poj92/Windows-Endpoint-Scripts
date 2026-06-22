@@ -3,7 +3,7 @@
 <#
 Author: Peter Opeyemi James
 Company: Nexus Open Systems Ltd
-Date: 2026-06-01
+Date: 2026-05-05
 Email: Peter.James@nexusos.co.uk
 #>
 
@@ -92,18 +92,6 @@ $BrowserRunningWindowHoursText = Format-HourValue -Hours $BrowserRunningWindowHo
 $BrowserInactiveWindowHoursText = Format-HourValue -Hours $BrowserInactiveWindowHours
 
 $ApiTimeoutSeconds = 20
-
-# Chrome latest-version policy:
-#   GeneralStable (default) = use the latest non-early-stable desktop stable release from Chrome Releases.
-#   VersionHistoryApi       = use Google's VersionHistory stable API, which may include early-stable versions.
-#   Override                = use ChromeLatestVersionOverride.
-$ChromeLatestVersionPolicy = [Environment]::GetEnvironmentVariable('ChromeLatestVersionPolicy')
-if ([string]::IsNullOrWhiteSpace($ChromeLatestVersionPolicy)) { $ChromeLatestVersionPolicy = 'GeneralStable' }
-$ChromeLatestVersionPolicy = $ChromeLatestVersionPolicy.Trim()
-
-$ChromeLatestVersionOverride = [Environment]::GetEnvironmentVariable('ChromeLatestVersionOverride')
-if (-not [string]::IsNullOrWhiteSpace($ChromeLatestVersionOverride)) { $ChromeLatestVersionOverride = $ChromeLatestVersionOverride.Trim() }
-
 
 # =========================
 # Bootstrap
@@ -653,124 +641,18 @@ function Compare-VersionNewer {
     }
 }
 
-function ConvertFrom-ChromeReleaseHtmlText {
-    param([string]$Value)
-
-    if ([string]::IsNullOrWhiteSpace($Value)) { return '' }
-
-    $decoded = [System.Net.WebUtility]::HtmlDecode($Value)
-    $decoded = $decoded -replace '<br\s*/?>', ' '
-    $decoded = $decoded -replace '<[^>]+>', ' '
-    $decoded = $decoded -replace '\s+', ' '
-    return $decoded.Trim()
-}
-
-function Find-ChromeWindowsVersionInReleaseText {
-    param([string]$Text)
-
-    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
-
-    # Examples handled:
-    #   148.0.7778.216/217 for Windows
-    #   149.0.7827.53/.54 for Windows
-    #   148.0.7778.96/97 Windows/Mac
-    $patterns = @(
-        '(?<prefix>\d+\.\d+\.\d+)\.(?<first>\d+)\s*/\s*\.? (?<second>\d+)\s+(?:for\s+)?Windows',
-        '(?<prefix>\d+\.\d+\.\d+)\.(?<first>\d+)\s*/\s*\.? (?<second>\d+)\s+Windows',
-        '(?<version>\d+\.\d+\.\d+\.\d+)\s+(?:for\s+)?Windows'
-    )
-
-    foreach ($pattern in $patterns) {
-        $rx = [regex]::new($pattern.Replace(' ', ''), [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        $m = $rx.Match($Text)
-        if ($m.Success) {
-            if ($m.Groups['version'].Success) {
-                return $m.Groups['version'].Value
-            }
-            $prefix = $m.Groups['prefix'].Value
-            $first = $m.Groups['first'].Value
-            $second = $m.Groups['second'].Value
-            if ($second -match '^\d+$') {
-                # For Windows builds published as .216/217 or .53/.54, prefer the higher Windows build.
-                $firstInt = [int]$first
-                $secondInt = [int]$second
-                return ('{0}.{1}' -f $prefix, [Math]::Max($firstInt, $secondInt))
-            }
-        }
-    }
-
-    return $null
-}
-
-function Get-LatestChromeGeneralStableVersion {
-    try {
-        $uri = 'https://chromereleases.googleblog.com/feeds/posts/default/-/Stable%20updates?alt=json&max-results=20'
-        $feed = Invoke-RestMethod -Uri $uri -TimeoutSec $ApiTimeoutSeconds -ErrorAction Stop
-
-        if (-not $feed.feed.entry) { return $null }
-
-        foreach ($entry in @($feed.feed.entry)) {
-            $title = ConvertFrom-ChromeReleaseHtmlText -Value ([string]$entry.title.'$t')
-            if ([string]::IsNullOrWhiteSpace($title)) { $title = ConvertFrom-ChromeReleaseHtmlText -Value ([string]$entry.title.'#text') }
-            if ([string]::IsNullOrWhiteSpace($title)) { $title = ConvertFrom-ChromeReleaseHtmlText -Value ([string]$entry.title) }
-
-            # Do not treat Early Stable as the general latest target. It is served only to a small rollout cohort.
-            if ($title -notmatch '^Stable Channel Update for Desktop$') { continue }
-            if ($title -match 'Early Stable') { continue }
-
-            $content = ConvertFrom-ChromeReleaseHtmlText -Value ([string]$entry.content.'$t')
-            if ([string]::IsNullOrWhiteSpace($content)) { $content = ConvertFrom-ChromeReleaseHtmlText -Value ([string]$entry.content.'#text') }
-            $version = Find-ChromeWindowsVersionInReleaseText -Text $content
-            if ($version) {
-                Write-LogEntry "Latest Chrome version source: Chrome Releases general Stable Channel Update for Desktop. Version=$version"
-                return $version
-            }
-        }
-    }
-    catch {
-        Write-LogEntry "Unable to fetch Chrome general stable version from Chrome Releases feed: $($_.Exception.Message)" "Warning"
-    }
-
-    return $null
-}
-
-function Get-LatestChromeVersionHistoryApiVersion {
+function Get-LatestChromeVersion {
     try {
         $uri = "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/stable/versions?pageSize=1"
         $response = Invoke-RestMethod -Uri $uri -TimeoutSec $ApiTimeoutSeconds -ErrorAction Stop
         if ($response.versions -and $response.versions.Count -gt 0) {
-            $version = $response.versions[0].version
-            Write-LogEntry "Latest Chrome version source: VersionHistory API stable channel. Version=$version"
-            return $version
+            return $response.versions[0].version
         }
     }
     catch {
-        Write-LogEntry "Unable to fetch latest Chrome version from VersionHistory API: $($_.Exception.Message)" "Warning"
+        Write-LogEntry "Unable to fetch latest Chrome version: $($_.Exception.Message)" "Warning"
     }
     return $null
-}
-
-function Get-LatestChromeVersion {
-    if (-not [string]::IsNullOrWhiteSpace($ChromeLatestVersionOverride)) {
-        try {
-            [void][version]$ChromeLatestVersionOverride
-            Write-LogEntry "Latest Chrome version source: ChromeLatestVersionOverride. Version=$ChromeLatestVersionOverride"
-            return $ChromeLatestVersionOverride
-        }
-        catch {
-            Write-LogEntry "ChromeLatestVersionOverride has invalid version value '$ChromeLatestVersionOverride'. Ignoring override." "Warning"
-        }
-    }
-
-    if ($ChromeLatestVersionPolicy -ieq 'VersionHistoryApi' -or $ChromeLatestVersionPolicy -ieq 'EarlyStableAllowed') {
-        return Get-LatestChromeVersionHistoryApiVersion
-    }
-
-    $generalStable = Get-LatestChromeGeneralStableVersion
-    if ($generalStable) { return $generalStable }
-
-    Write-LogEntry "Falling back to VersionHistory API for Chrome latest version because general stable release feed did not return a usable version." "Warning"
-    return Get-LatestChromeVersionHistoryApiVersion
 }
 
 function Get-LatestFirefoxVersion {
@@ -836,21 +718,9 @@ function Test-ChromePendingUpdate {
             }
 
             $oldProductVersion = ConvertTo-NormalizedVersionString -Value $props.opv
-            if ($oldProductVersion -and $chromeVersion) {
-                try {
-                    if ([version]$oldProductVersion -gt [version]$chromeVersion) {
-                        Write-LogEntry "Chrome pending update detected via staged/current version mismatch at $updateRegPath. opv=$oldProductVersion current=$chromeVersion"
-                        return $true
-                    }
-                    elseif ([version]$oldProductVersion -lt [version]$chromeVersion) {
-                        Write-LogEntry "Ignoring older Chrome opv at $updateRegPath. opv=$oldProductVersion current=$chromeVersion"
-                    }
-                }
-                catch {
-                    if ($oldProductVersion -ne $chromeVersion) {
-                        Write-LogEntry "Chrome opv/current versions differ but could not be compared. opv=$oldProductVersion current=$chromeVersion" "Warning"
-                    }
-                }
+            if ($oldProductVersion -and $chromeVersion -and $oldProductVersion -ne $chromeVersion) {
+                Write-LogEntry "Chrome pending update detected via staged/current version mismatch at $updateRegPath. opv=$oldProductVersion current=$chromeVersion"
+                return $true
             }
         }
 
@@ -869,25 +739,8 @@ function Test-ChromePendingUpdate {
 
             if (@($versionFolders).Count -gt 1) {
                 $folderList = (@($versionFolders | Select-Object -ExpandProperty Name) -join ', ')
-                $highestFolderVersion = ConvertTo-NormalizedVersionString -Value $versionFolders[0].Name
-
-                if ($chromeVersion -and $highestFolderVersion) {
-                    try {
-                        if ([version]$highestFolderVersion -gt [version]$chromeVersion) {
-                            Write-LogEntry "Chrome pending update detected via higher staged version folder. Installed=$chromeVersion HighestFolder=$highestFolderVersion Folders=$folderList"
-                            return $true
-                        }
-                        else {
-                            Write-LogEntry "Chrome has multiple version folders but highest folder is not newer than installed version. Installed=$chromeVersion HighestFolder=$highestFolderVersion Folders=$folderList"
-                        }
-                    }
-                    catch {
-                        Write-LogEntry "Chrome has multiple version folders, but folder/installed versions could not be compared. Installed=$chromeVersion Folders=$folderList" "Warning"
-                    }
-                }
-                else {
-                    Write-LogEntry "Chrome has multiple version folders but installed version is unknown. Not treating this alone as a pending update. Folders=$folderList" "Warning"
-                }
+                Write-LogEntry "Chrome possible pending update detected via multiple version folders: $folderList"
+                return $true
             }
         }
 
@@ -926,21 +779,9 @@ function Test-EdgePendingUpdate {
             }
 
             $oldProductVersion = ConvertTo-NormalizedVersionString -Value $props.opv
-            if ($oldProductVersion -and $edgeVersion) {
-                try {
-                    if ([version]$oldProductVersion -gt [version]$edgeVersion) {
-                        Write-LogEntry "Edge pending update detected via staged/current version mismatch at $updateRegPath. opv=$oldProductVersion current=$edgeVersion"
-                        return $true
-                    }
-                    elseif ([version]$oldProductVersion -lt [version]$edgeVersion) {
-                        Write-LogEntry "Ignoring older Edge opv at $updateRegPath. opv=$oldProductVersion current=$edgeVersion"
-                    }
-                }
-                catch {
-                    if ($oldProductVersion -ne $edgeVersion) {
-                        Write-LogEntry "Edge opv/current versions differ but could not be compared. opv=$oldProductVersion current=$edgeVersion" "Warning"
-                    }
-                }
+            if ($oldProductVersion -and $edgeVersion -and $oldProductVersion -ne $edgeVersion) {
+                Write-LogEntry "Edge pending update detected via staged/current version mismatch at $updateRegPath. opv=$oldProductVersion current=$edgeVersion"
+                return $true
             }
         }
 
@@ -959,25 +800,8 @@ function Test-EdgePendingUpdate {
 
             if (@($versionFolders).Count -gt 1) {
                 $folderList = (@($versionFolders | Select-Object -ExpandProperty Name) -join ', ')
-                $highestFolderVersion = ConvertTo-NormalizedVersionString -Value $versionFolders[0].Name
-
-                if ($edgeVersion -and $highestFolderVersion) {
-                    try {
-                        if ([version]$highestFolderVersion -gt [version]$edgeVersion) {
-                            Write-LogEntry "Edge pending update detected via higher staged version folder. Installed=$edgeVersion HighestFolder=$highestFolderVersion Folders=$folderList"
-                            return $true
-                        }
-                        else {
-                            Write-LogEntry "Edge has multiple version folders but highest folder is not newer than installed version. Installed=$edgeVersion HighestFolder=$highestFolderVersion Folders=$folderList"
-                        }
-                    }
-                    catch {
-                        Write-LogEntry "Edge has multiple version folders, but folder/installed versions could not be compared. Installed=$edgeVersion Folders=$folderList" "Warning"
-                    }
-                }
-                else {
-                    Write-LogEntry "Edge has multiple version folders but installed version is unknown. Not treating this alone as a pending update. Folders=$folderList" "Warning"
-                }
+                Write-LogEntry "Edge possible pending update detected via multiple version folders: $folderList"
+                return $true
             }
         }
 
@@ -1089,11 +913,6 @@ function Get-ExistingReloadQueue {
             if (-not ($item.PSObject.Properties.Name -contains 'RemediationMode')) {
                 $item | Add-Member -MemberType NoteProperty -Name RemediationMode -Value $null -Force
             }
-            foreach ($metaName in @('InstalledVersion','LatestVersion','OutOfDate','PendingUpdate','LastDetectedUtc')) {
-                if (-not ($item.PSObject.Properties.Name -contains $metaName)) {
-                    $item | Add-Member -MemberType NoteProperty -Name $metaName -Value $null -Force
-                }
-            }
         }
 
         return @($queue.Browsers)
@@ -1122,37 +941,6 @@ function Save-ReloadQueue {
     }
 }
 
-function Add-QueueMetadata {
-    param(
-        [Parameter(Mandatory = $true)]$Item,
-        [object]$VersionStatus
-    )
-
-    if ($null -ne $VersionStatus) {
-        foreach ($pair in @(
-            @{ Name = 'InstalledVersion'; Value = $VersionStatus.Installed },
-            @{ Name = 'LatestVersion';    Value = $VersionStatus.Latest },
-            @{ Name = 'OutOfDate';        Value = $VersionStatus.OutOfDate },
-            @{ Name = 'PendingUpdate';    Value = $VersionStatus.PendingUpdate }
-        )) {
-            if (-not ($Item.PSObject.Properties.Name -contains $pair.Name)) {
-                $Item | Add-Member -MemberType NoteProperty -Name $pair.Name -Value $pair.Value -Force
-            }
-            else {
-                $Item.($pair.Name) = $pair.Value
-            }
-        }
-    }
-
-    $nowUtc = (Get-Date).ToUniversalTime().ToString('o')
-    if (-not ($Item.PSObject.Properties.Name -contains 'LastDetectedUtc')) {
-        $Item | Add-Member -MemberType NoteProperty -Name LastDetectedUtc -Value $nowUtc -Force
-    }
-    else {
-        $Item.LastDetectedUtc = $nowUtc
-    }
-}
-
 function Add-OrUpdateQueueItem {
     param(
         [System.Collections.ArrayList]$Queue,
@@ -1160,8 +948,7 @@ function Add-OrUpdateQueueItem {
         [string]$Browser,
         [string]$Reason,
         [ValidateSet("InteractiveRestart","ClosedUpdateCycle")]
-        [string]$RemediationMode = "InteractiveRestart",
-        [object]$VersionStatus = $null
+        [string]$RemediationMode = "InteractiveRestart"
     )
 
     $existingInNewQueue = $Queue | Where-Object { $_.Browser -eq $Browser } | Select-Object -First 1
@@ -1175,38 +962,33 @@ function Add-OrUpdateQueueItem {
             $existingInNewQueue.RemediationMode = $RemediationMode
         }
 
-        Add-QueueMetadata -Item $existingInNewQueue -VersionStatus $VersionStatus
-        Write-LogEntry "$Browser already queued in current run; updated reason, remediation mode, and version metadata to $RemediationMode"
+        Write-LogEntry "$Browser already queued in current run; updated reason and remediation mode to $RemediationMode"
         return
     }
 
     $existingSavedItem = $ExistingQueue | Where-Object { $_.Browser -eq $Browser } | Select-Object -First 1
 
     if ($existingSavedItem) {
-        $newItem = [PSCustomObject]@{
+        [void]$Queue.Add([PSCustomObject]@{
             Browser           = $Browser
             Reason            = $Reason
             PostponeUntilUtc  = $existingSavedItem.PostponeUntilUtc
             PostponeChoice    = $existingSavedItem.PostponeChoice
             ScheduledTaskName = $existingSavedItem.ScheduledTaskName
             RemediationMode   = $RemediationMode
-        }
-        Add-QueueMetadata -Item $newItem -VersionStatus $VersionStatus
-        [void]$Queue.Add($newItem)
-        Write-LogEntry "$Browser added to reload queue with preserved postpone state, remediation mode $RemediationMode, and version metadata"
+        })
+        Write-LogEntry "$Browser added to reload queue with preserved postpone state and remediation mode $RemediationMode"
     }
     else {
-        $newItem = [PSCustomObject]@{
+        [void]$Queue.Add([PSCustomObject]@{
             Browser           = $Browser
             Reason            = $Reason
             PostponeUntilUtc  = $null
             PostponeChoice    = $null
             ScheduledTaskName = $null
             RemediationMode   = $RemediationMode
-        }
-        Add-QueueMetadata -Item $newItem -VersionStatus $VersionStatus
-        [void]$Queue.Add($newItem)
-        Write-LogEntry "$Browser added to reload queue with remediation mode $RemediationMode and version metadata"
+        })
+        Write-LogEntry "$Browser added to reload queue with remediation mode $RemediationMode"
     }
 }
 
@@ -1257,7 +1039,7 @@ try {
             }
 
             $immediateReason = "Browser is closed and is " + ($immediateReasonParts -join " and ") + "; queued immediately for open/update/close cycle"
-            Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $immediateReason -RemediationMode "ClosedUpdateCycle" -VersionStatus $versionStatus
+            Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $immediateReason -RemediationMode "ClosedUpdateCycle"
             Write-LogEntry "$browser is closed and is $($immediateReasonParts -join ' and '). Inactive window threshold is bypassed for immediate treatment."
             continue
         }
@@ -1274,7 +1056,7 @@ try {
 
         if ($stateInfo.IsRunning) {
             if ($versionStatus.PendingUpdate) {
-                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason "Pending update and browser has been running continuously for at least $BrowserRunningWindowHoursText hours" -RemediationMode "InteractiveRestart" -VersionStatus $versionStatus
+                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason "Pending update and browser has been running continuously for at least $BrowserRunningWindowHoursText hours" -RemediationMode "InteractiveRestart"
             }
             else {
                 Write-LogEntry "$browser is running for $BrowserRunningWindowHoursText+ hours but no pending update was detected"
@@ -1296,7 +1078,7 @@ try {
 
             if ($needsClosedUpdateCycle) {
                 $reason = "Browser has not been used for at least $BrowserInactiveWindowHoursText hours and is " + ($reasonParts -join " and ") + "; queued for open/update/close cycle"
-                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $reason -RemediationMode "ClosedUpdateCycle" -VersionStatus $versionStatus
+                Add-OrUpdateQueueItem -Queue $queue -ExistingQueue $existingQueue -Browser $browser -Reason $reason -RemediationMode "ClosedUpdateCycle"
             }
             else {
                 Write-LogEntry "$browser has not been used for $BrowserInactiveWindowHoursText+ hours, but no pending update or confirmed out-of-date version was detected"

@@ -1,4 +1,4 @@
-#<#
+<#
 Author: Peter Opeyemi James
 Company: Nexus Open Systems Ltd
 Date: 2026-05-05
@@ -6,14 +6,15 @@ Email: Peter.James@nexusos.co.uk
 #>
 
 <#
-Detects and remediates vulnerable Dell Peripheral Manager / Dell Display and Peripheral Manager 
-installs on Dell systems. The component skips non-Dell devices by default, removes any DPM/DDPM 
-version below the configured minimum, verifies removal, and only then downloads and installs 
-the configured DDPM package. Installer URL, version, and SHA-256 are supplied as Datto 
-variables for long-term maintainability.
+Detects vulnerable Dell Peripheral Manager / Dell Display and Peripheral Manager installs on
+Dell systems and optionally remediates them. The component skips non-Dell devices by default.
+When Remediate is set to true, it removes any DPM/DDPM version below the configured minimum,
+verifies removal, and only then downloads and installs the configured DDPM package. When
+Remediate is false, it reports compliance only and makes no changes. Installer URL, version,
+and SHA-256 are supplied as Datto variables for long-term maintainability.
 
 Datto Variables:
-    Mode = Remediate
+    Remediate = false
     MinimumSafeVersion = 1.7.6
     SkipNonDell = true
     LatestDDPMUrl = https://dl.dell.com/FOLDERxxxxx/1/DDPM-Setup_x.x.x.xx.exe
@@ -27,8 +28,9 @@ Datto Variables:
 #>
 
 param(
-    [ValidateSet("Detect","Remediate")]
-    [string]$Mode = "Remediate",
+    # Primary Datto control. Accepts true/false, yes/no, 1/0, on/off.
+    # false = report only; true = remediate when non-compliant.
+    [object]$Remediate = $null,
 
     [string]$MinimumSafeVersion = "1.7.6",
 
@@ -49,7 +51,7 @@ param(
 
 # Exit codes
 # 0 = compliant / remediation succeeded
-# 1 = non-compliant detected (Detect mode)
+# 1 = non-compliant detected in report-only mode
 # 2 = fatal script error
 # 3 = skipped non-Dell device
 # 4 = below-minimum software found, but uninstall verification failed; install not attempted
@@ -104,6 +106,62 @@ function Resolve-InputValue {
     catch {}
 
     return ""
+}
+
+function Resolve-BooleanSetting {
+    param(
+        [object]$CurrentValue,
+        [string]$EnvName,
+        [bool]$DefaultValue,
+        [string[]]$Aliases = @()
+    )
+
+    $candidateNames = @($EnvName) + $Aliases
+    $rawValue = $null
+    $sourceName = $null
+
+    if ($null -ne $CurrentValue -and -not [string]::IsNullOrWhiteSpace(([string]$CurrentValue))) {
+        $rawValue = [string]$CurrentValue
+        $sourceName = "parameter:$EnvName"
+    }
+    else {
+        foreach ($name in $candidateNames) {
+            try {
+                $envValue = [Environment]::GetEnvironmentVariable($name)
+                if (-not [string]::IsNullOrWhiteSpace($envValue)) {
+                    $rawValue = $envValue
+                    $sourceName = "environment:$name"
+                    break
+                }
+            }
+            catch {}
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($rawValue)) {
+        return [pscustomobject]@{
+            Value  = $DefaultValue
+            Source = "default"
+            Raw    = ""
+        }
+    }
+
+    switch -Regex ($rawValue.Trim().ToLowerInvariant()) {
+        '^(\$?true|1|yes|y|on)$' {
+            return [pscustomobject]@{ Value = $true; Source = $sourceName; Raw = $rawValue }
+        }
+        '^(\$?false|0|no|n|off)$' {
+            return [pscustomobject]@{ Value = $false; Source = $sourceName; Raw = $rawValue }
+        }
+        default {
+            Write-Log ("Invalid boolean value '{0}' for {1}. Using default: {2}" -f $rawValue, $EnvName, $DefaultValue) "WARN"
+            return [pscustomobject]@{
+                Value  = $DefaultValue
+                Source = "default-invalid-$sourceName"
+                Raw    = $rawValue
+            }
+        }
+    }
 }
 
 function Try-DeriveVersionFromText {
@@ -696,8 +754,11 @@ function Assert-TargetDDPMDetected {
     }
 }
 
+$remediationSetting = Resolve-BooleanSetting -CurrentValue $Remediate -EnvName "Remediate" -DefaultValue $false -Aliases @("PerformRemediation", "EnableRemediation", "AllowRemediation")
+$script:ShouldRemediate = [bool]$remediationSetting.Value
+
 Write-Log "========== Dell DPM/DDPM compliance script =========="
-Write-Log ("Mode: {0}" -f $Mode)
+Write-Log ("Remediate: {0} (source: {1})" -f $script:ShouldRemediate, $remediationSetting.Source)
 Write-Log ("MinimumSafeVersion: {0}" -f $MinimumSafeVersion)
 Write-Log ("SkipNonDell: {0}" -f $SkipNonDell)
 Write-Log ("WorkingDirectory: {0}" -f $WorkingDirectory)
@@ -720,16 +781,18 @@ try {
         }
     }
 
-    if ($Mode -eq "Detect") {
+    if (-not $script:ShouldRemediate) {
         if ($initial.BelowMinimumApps.Count -gt 0) {
-            Write-Log "Detection result: NON-COMPLIANT" "WARN"
+            Write-Log "Report-only result: NON-COMPLIANT. Remediate=false, so no uninstall, cleanup, download, or install actions were performed." "WARN"
             exit 1
         }
         else {
-            Write-Log "Detection result: COMPLIANT" "SUCCESS"
+            Write-Log "Report-only result: COMPLIANT. Remediate=false, so no changes were performed." "SUCCESS"
             exit 0
         }
     }
+
+    Write-Log "Remediate=true. Non-compliant installs will be removed and the configured DDPM package will be installed if required."
 
     if ($initial.BelowMinimumApps.Count -eq 0) {
         Write-Log "No below-minimum DPM/DDPM found. No remediation required, and DDPM install will not be attempted." "SUCCESS"

@@ -3,22 +3,20 @@
 <#
 Author: Peter Opeyemi James
 Company: Nexus Open Systems Ltd
-Date: 2026-06-17
+Date: 2026-05-05
 Email: Peter.James@nexusos.co.uk
 #>
 
 <#
-VC++ Any-Version Conditional Install + MinKeep Cleanup
+VC++ Any-Version Conditional Install + MinKeep Cleanup (fix: op_Addition + correct counts)
 
 Rules:
 1) Detect installed "Microsoft Visual C++" entries (x86/x64) from ARP.
-2) Default behaviour is unchanged:
-   - If NO installed VC++ entry is below MinKeepVersion => DO NOTHING (no install).
-   - If any installed VC++ entry is below MinKeepVersion, install the provided URL installer(s) ONLY for affected architecture(s), then remove entries below MinKeepVersion.
-3) Optional force behaviour:
-   - ForceTargetVersionInstallx64=true installs the x64 target installer even when no x64 entry is below MinKeepVersion / newer x64 versions already exist.
-   - ForceTargetVersionInstallx86=true installs the x86 target installer even when no x86 entry is below MinKeepVersion / newer x86 versions already exist.
-   - Forced target installer versions are validated and refused if below MinKeepVersion.
+2) If NO installed VC++ entry is below MinKeepVersion => DO NOTHING (no install).
+3) If any installed VC++ entry is below MinKeepVersion:
+   - Install provided URL installer(s) ONLY for architectures that have below-min items
+   - Uninstall all VC++ entries below MinKeepVersion
+   - Rescan & remove any remaining below-min entries
 4) Clean up downloaded installers.
 
 Datto env vars:
@@ -29,8 +27,6 @@ Datto env vars:
   VCRedist_IncludeX64
   VCRedist_IncludeX86
   VCRedist_ForceMSI
-  VCRedist_ForceTargetVersionInstallx64 (also accepts ForceTargetVersionInstallx64)
-  VCRedist_ForceTargetVersionInstallx86 (also accepts ForceTargetVersionInstallx86)
   VCRedist_LogPath
 
 Exit codes:
@@ -50,8 +46,6 @@ param(
   [switch]$IncludeX64,
   [switch]$IncludeX86,
   [switch]$ForceMSI,
-  [switch]$ForceTargetVersionInstallX64,
-  [switch]$ForceTargetVersionInstallX86,
   [string]$LogPath = "$env:ProgramData\NexusOpenSystems\VCRedist\VCRedistUpdate.log"
 )
 
@@ -79,12 +73,6 @@ if (-not $PSBoundParameters.ContainsKey('ReportOnly'))     { $ReportOnly     = G
 if (-not $PSBoundParameters.ContainsKey('IncludeX64'))     { $IncludeX64     = Get-EnvBool 'VCRedist_IncludeX64' $true }
 if (-not $PSBoundParameters.ContainsKey('IncludeX86'))     { $IncludeX86     = Get-EnvBool 'VCRedist_IncludeX86' $true }
 if (-not $PSBoundParameters.ContainsKey('ForceMSI'))       { $ForceMSI       = Get-EnvBool 'VCRedist_ForceMSI' $false }
-if (-not $PSBoundParameters.ContainsKey('ForceTargetVersionInstallX64')) {
-  $ForceTargetVersionInstallX64 = Get-EnvBool 'VCRedist_ForceTargetVersionInstallx64' (Get-EnvBool 'ForceTargetVersionInstallx64' $false)
-}
-if (-not $PSBoundParameters.ContainsKey('ForceTargetVersionInstallX86')) {
-  $ForceTargetVersionInstallX86 = Get-EnvBool 'VCRedist_ForceTargetVersionInstallx86' (Get-EnvBool 'ForceTargetVersionInstallx86' $false)
-}
 if (-not $PSBoundParameters.ContainsKey('LogPath')) {
   $lp = Get-Env 'VCRedist_LogPath'
   if ($lp) { $LogPath = $lp }
@@ -216,34 +204,6 @@ function Download-File([string]$Url, [string]$OutFile) {
   Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing
 }
 
-function Get-InstallerVersion([string]$InstallerPath) {
-  if (-not $InstallerPath -or -not (Test-Path $InstallerPath)) { return $null }
-
-  try {
-    $info = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($InstallerPath)
-    foreach ($candidate in @($info.ProductVersion, $info.FileVersion)) {
-      $parsed = Parse-VersionFlexible $candidate
-      if ($parsed) { return $parsed }
-    }
-  } catch { }
-
-  return $null
-}
-
-function Assert-ForcedTargetVersionIsAllowed([string]$InstallerPath, [string]$Label, [Version]$MinimumKeepVersion) {
-  $targetVersion = Get-InstallerVersion $InstallerPath
-  if (-not $targetVersion) {
-    throw "Could not determine $Label target installer version from file metadata. Refusing forced install because the target version must be verified as not below MinKeepVersion $MinimumKeepVersion."
-  }
-
-  Write-Log ("{0} target installer version detected: {1}" -f $Label, $targetVersion)
-  if ($targetVersion -lt $MinimumKeepVersion) {
-    throw "Refusing forced install of $Label because target version $targetVersion is below MinKeepVersion $MinimumKeepVersion."
-  }
-
-  return $targetVersion
-}
-
 function Install-FromExe([string]$InstallerPath, [string]$Label) {
   Write-Log "Installing $Label (silent)..."
   $p = Start-Process -FilePath $InstallerPath -ArgumentList "/install /quiet /norestart" -Wait -PassThru -NoNewWindow
@@ -256,7 +216,7 @@ try {
   if (-not (Test-IsAdmin)) { throw "Run elevated (Administrator / SYSTEM)." }
 
   Write-Log "Starting VC++ (any-version) conditional install + MinKeep cleanup..."
-  Write-Log ("Options: ReportOnly={0} IncludeX64={1} IncludeX86={2} ForceMSI={3} ForceTargetVersionInstallx64={4} ForceTargetVersionInstallx86={5}" -f $ReportOnly, $IncludeX64, $IncludeX86, $ForceMSI, $ForceTargetVersionInstallX64, $ForceTargetVersionInstallX86)
+  Write-Log ("Options: ReportOnly={0} IncludeX64={1} IncludeX86={2} ForceMSI={3}" -f $ReportOnly, $IncludeX64, $IncludeX86, $ForceMSI)
 
   if (-not $IncludeX64 -and -not $IncludeX86) { throw "Both IncludeX64 and IncludeX86 are false; nothing to do." }
   if (-not $MinKeepVersion) { throw "VCRedist_MinKeepVersion is required." }
@@ -298,26 +258,17 @@ try {
 
   Write-Log ("Entries below MinKeepVersion: x64={0} x86={1} total={2}" -f (@($belowMinX64).Count), (@($belowMinX86).Count), (@($belowMinAll).Count))
 
-  $forceInstallX64 = ($IncludeX64 -and [bool]$ForceTargetVersionInstallX64)
-  $forceInstallX86 = ($IncludeX86 -and [bool]$ForceTargetVersionInstallX86)
-
-  $installX64 = ($IncludeX64 -and ((@($belowMinX64).Count -gt 0) -or $forceInstallX64))
-  $installX86 = ($IncludeX86 -and ((@($belowMinX86).Count -gt 0) -or $forceInstallX86))
-
-  Write-Log ("Force target install requested: x64={0} x86={1}" -f $forceInstallX64, $forceInstallX86)
-  Write-Log ("Install plan: x64={0} x86={1}" -f $installX64, $installX86)
-
-  if ((@($belowMinAll).Count -eq 0) -and (-not $installX64) -and (-not $installX86)) {
-    Write-Log "No installed VC++ entries below MinKeepVersion and no force target install requested. No install/uninstall will be performed."
+  if (@($belowMinAll).Count -eq 0) {
+    Write-Log "No installed VC++ entries below MinKeepVersion. No install/uninstall will be performed."
     exit 0
   }
 
-  # URLs are required when that architecture needs normal remediation or force target install.
-  if ($installX64 -and -not $TargetUrlX64) { throw "Missing VCRedist_TargetUrl_X64 (needed because x64 install is planned)." }
-  if ($installX86 -and -not $TargetUrlX86) { throw "Missing VCRedist_TargetUrl_X86 (needed because x86 install is planned)." }
+  # URLs required only if that architecture has below-min entries
+  if ($IncludeX64 -and (@($belowMinX64).Count -gt 0) -and -not $TargetUrlX64) { throw "Missing VCRedist_TargetUrl_X64 (needed because x64 has below-min entries)." }
+  if ($IncludeX86 -and (@($belowMinX86).Count -gt 0) -and -not $TargetUrlX86) { throw "Missing VCRedist_TargetUrl_X86 (needed because x86 has below-min entries)." }
 
   if ($ReportOnly) {
-    Write-Log "ReportOnly: would install from provided URL(s) for planned arch(es), validate forced target version(s) before install, and remove below-min entries."
+    Write-Log "ReportOnly: would install from provided URL(s) for affected arch(es) and remove below-min entries."
     exit 2
   }
 
@@ -325,34 +276,22 @@ try {
   New-Item -ItemType Directory -Path $tmp -Force | Out-Null
 
   try {
-    if ($installX64) {
+    if ($IncludeX64 -and (@($belowMinX64).Count -gt 0)) {
       $fileX64 = Join-Path $tmp "vc_redist.x64.exe"
       Write-Log "Downloading target x64 installer..."
       Download-File -Url $TargetUrlX64 -OutFile $fileX64
-      if ($forceInstallX64) {
-        $targetX64Version = Assert-ForcedTargetVersionIsAllowed -InstallerPath $fileX64 -Label "VC++ target x64" -MinimumKeepVersion $minKeep
-        if ($maxX64 -and ($targetX64Version -lt $maxX64)) {
-          Write-Log ("x64: target version {0} is below highest detected version {1}; ForceTargetVersionInstallx64=true so install will be attempted." -f $targetX64Version, $maxX64)
-        }
-      }
       Install-FromExe -InstallerPath $fileX64 -Label "VC++ target x64 (from URL)"
     } else {
-      Write-Log "x64: no below-min entries and no force target install requested; skipping install."
+      Write-Log "x64: no below-min entries; skipping install."
     }
 
-    if ($installX86) {
+    if ($IncludeX86 -and (@($belowMinX86).Count -gt 0)) {
       $fileX86 = Join-Path $tmp "vc_redist.x86.exe"
       Write-Log "Downloading target x86 installer..."
       Download-File -Url $TargetUrlX86 -OutFile $fileX86
-      if ($forceInstallX86) {
-        $targetX86Version = Assert-ForcedTargetVersionIsAllowed -InstallerPath $fileX86 -Label "VC++ target x86" -MinimumKeepVersion $minKeep
-        if ($maxX86 -and ($targetX86Version -lt $maxX86)) {
-          Write-Log ("x86: target version {0} is below highest detected version {1}; ForceTargetVersionInstallx86=true so install will be attempted." -f $targetX86Version, $maxX86)
-        }
-      }
       Install-FromExe -InstallerPath $fileX86 -Label "VC++ target x86 (from URL)"
     } else {
-      Write-Log "x86: no below-min entries and no force target install requested; skipping install."
+      Write-Log "x86: no below-min entries; skipping install."
     }
 
     Write-Log "Removing installed VC++ entries below MinKeepVersion..."

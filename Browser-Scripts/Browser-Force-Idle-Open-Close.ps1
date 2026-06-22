@@ -2,6 +2,12 @@
 <#
 Browser-Force-Open-Close.ps1 (SAFE PER-BROWSER)
 
+Author: Peter Opeyemi James
+Company: Nexus Open Systems Ltd
+Date: 2026-06-01
+Email: Peter.James@nexusos.co.uk
+
+
 Goal:
   - If the browser is currently running (any instance): DO NOT TOUCH IT (no launch/no close).
   - Else, decide if it was opened within the last N hours.

@@ -3,7 +3,7 @@
 <#
 Author: Peter Opeyemi James
 Company: Nexus Open Systems Ltd
-Date: 2026-06-01
+Date: 2026-05-22
 Email: Peter.James@nexusos.co.uk
 #>
 
@@ -1177,8 +1177,21 @@ try {
 
         $isBrowserRunningNow = Test-BrowserRunning -BrowserName $browser
         if (-not $isBrowserRunningNow) {
-            Write-LogEntry "$browser is currently closed. This user-notification remediation handles running browsers only. Leaving item queued for the closed-browser open/update/close worker. RemediationMode=$($item.RemediationMode)"
-            $remainingQueue += $item
+            Write-LogEntry "$browser is currently closed. Running immediate open/update/close cycle without user prompt. RemediationMode=$($item.RemediationMode)"
+
+            if (Invoke-ClosedBrowserUpdateCycle -BrowserName $browser -WaitSeconds $ClosedBrowserUpdateWaitSeconds -EngineWaitSeconds $BrowserUpdateEngineWaitSeconds) {
+                $tracking = Get-BrowserUsageTracking
+                $tracking.$browser.LastStop = (Get-Date).ToString("o")
+                $tracking.$browser.IsRunning = $false
+
+                if (-not (Save-BrowserUsageTracking -TrackingData $tracking)) {
+                    Write-LogEntry "$browser closed-browser update cycle completed, but usage tracking could not be updated. Continuing so the queue can still be cleared." "Warning"
+                }
+            }
+            else {
+                $remainingQueue += $item
+            }
+
             continue
         }
 

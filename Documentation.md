@@ -1,386 +1,64 @@
-# Windows Endpoint Scripts - Documentation
-
-Complete reference guide for all PowerShell scripts in this repository. These scripts are optimized for deployment through Datto RMM and other endpoint management platforms.
-
-Author:             Peter James
-Email:              peter.james@nexusos.co.uk
-Document Version:   v1.2
-
----
-
-## Table of Contents
-
-1. [Browser Scripts](#browser-scripts)
-2. [Java Scripts](#java-scripts)
-3. [Windows Update Scripts](#windows-update-scripts)
-4. [ConnectSecure](#connectsecure)
-5. [Dell Peripheral Manager](#dell-peripheral-manager)
-6. [Office Application](#office-application)
-7. [Python](#python)
-8. [VC++ Redistributables](#vc-redistributables)
-9. [Zoom](#zoom)
-10. [Winget](#winget)
-11. [Collection Utilities](#collection-utilities)
-
----
-
-## Browser Scripts
-
-### Browser-Update-Detection.ps1
-
-**Purpose**: Detects when browsers have pending updates that require a restart to apply. Tracks browser usage state and generates update notifications.
-
-**Execution Context**: Must run as SYSTEM
-
-**Key Features**:
-- Detects Chrome, Firefox, and Edge sessions
-- Tracks browser usage history with JSON-based state tracking
-- Identifies browsers running long enough to warrant restart
-- Logs all detection activity for auditing
-
-**Configuration Paths**:
-- Base Directory: `C:\ProgramData\Datto\BrowserUpdateCheck`
-- Log File: `Detection.log`
-- Tracking File: `BrowserUsageTracking.json`
-- Reload Queue: `ReloadQueue.json`
-
-**Parameters** (Configuration Variables):
-- `$BrowserReloadThresholdHours` (default: 24) - Hours of runtime before restart recommended
-- `$ApiTimeoutSeconds` (default: 20) - API call timeout
-
-**Exit Codes**:
-- Returns output to stdout for RMM parsing
-
-**Typical RMM Setup**: Set as detection script paired with Browser-Apply-Update-Notify-Reload.ps1
-
----
-
-### Browser-Apply-Update-Notify-Reload.ps1
-
-**Purpose**: Forces graceful browser restart for pending updates. Shows user notification with countdown, handles postpone requests, and enforces browser reload when updates are pending.
-
-**Execution Context**: Must run as logged-in user context (use Datto InteractiveToken)
-
-**Key Features**:
-- Graceful browser restart with user notification
-- Countdown timer (default 300 seconds)
-- Postpone options for users
-- Scheduled task cleanup on completion
-- Comprehensive logging for troubleshooting
-
-**RMM Component Variables**:
-- `ScheduledTaskName` - Optional scheduled task identifier
-
-**Configuration Variables**:
-- `$WarningTimeSeconds` (default: 300) - Countdown until forced restart
-- `$CompanyName` (default: "Nexus Open Systems Ltd") - Displayed in notifications
-- `$RemediationScriptPath` - Path to remediation script
-
-**Exit Codes**: Not specified (returns success/failure via output)
-
-**Typical RMM Setup**: Deploy as remediation script triggered by Browser-Update-Detection.ps1 detection
-
----
-
-### Browser-Force-Idle-Open-Close.ps1
-
-**Purpose**: Safely launches browsers that haven't been used within a lookback window, then closes them after a specified duration. Useful for triggering update checks without user intervention.
-
-**Execution Context**: Can run as SYSTEM or user context
-
-**Key Features**:
-- Per-browser safety checks (never touches already-running browsers)
-- Uses Prefetch timestamps to detect recent usage
-- Creates temporary profile directories for clean launches
-- Only closes processes it started (via profile path matching)
-- Supports multiple browser preferences
-
-**Parameters**:
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `LookbackHours` | int | 24 | Hours to look back in usage history |
-| `OpenSeconds` | int | 120 | Seconds to keep browser open |
-| `Url` | string | 'about:blank' | URL to open |
-| `ReportOnly` | switch | False | Report without making changes |
-| `Preference` | string[] | @('Edge','Chrome','Firefox','Brave','Opera') | Browser launch order preference |
-
-**Exit Codes**:
-- `0` - No action needed (all browsers running or within window)
-- `1` - At least one browser launched and closed successfully
-- `2` - ReportOnly mode: would have launched browsers
-- `3` - No supported browsers installed
-- `4` - Error occurred
-
----
-
-### Browser-Force-Update-And-Reload.ps1
-
-**Purpose**: Forces Google Chrome and Microsoft Edge to check for and apply updates immediately. Prompts users for reload if required, with auto-reload after countdown expires.
-
-**Execution Context**: Recommended as SYSTEM (uses InteractiveToken for user-facing prompts)
-
-**Key Features**:
-- Force immediate update check for Chrome and Edge
-- User-friendly reload prompt with countdown
-- Automatic reload if user doesn't respond
-- Multiple update triggers for stability across builds
-- Preserves browser sessions via session restore
-- One-time scheduled task for user prompts
-
-**RMM Component Variables**:
-- `PromptOnly` - Show prompt without browser update
-- `ScheduledTaskName` - Custom scheduled task identifier
-- `BasePath` - Working directory (default: `C:\ProgramData\Datto\BrowserForceUpdate`)
-- `CompanyName` - Displayed in notifications
-- `CountdownSeconds` (default: 300) - Reload countdown timer
-- `UpdateWaitSeconds` (default: 90) - Max wait for update check
-- `PollIntervalSeconds` (default: 5) - Check interval
-- `GracefulCloseWaitSeconds` (default: 10) - Grace period for close
-- `RelaunchDelaySeconds` (default: 2) - Delay before relaunch
-- `PromptOnlyWhenBrowserIsRunning` (default: true) - Only prompt if running
-- `ForceKillRemainingProcesses` (default: true) - Force kill unresponsive
-
-**Exit Codes**: Returns success/failure via script invocation
-
----
-
-## Java Scripts
-
-### Java-JRE-Update.ps1
-
-**Purpose**: Manages Java JRE (Temurin or Oracle) installations. Detects, reports, installs, or upgrades JRE for specified major versions with optional cleanup.
-
-**Execution Context**: Must run with Administrator privileges
-
-**Key Features**:
-- Supports Java 8, 11, 17, 21 (major families)
-- Automatic version detection via winget
-- Optional MSI fallback for environments without winget
-- Selective removal of older versions in same family
-- JAVA_HOME and PATH cleanup
-- Comprehensive version normalization
-
-**RMM Component Variables**:
-
-| Parameter | Type | Default | Allowed Values | Description |
-|-----------|------|---------|-----------------|-------------|
-| `Vendor` | string | Temurin | Temurin, Oracle | Java distribution |
-| `TargetFamily` | int | 17 | 8, 11, 17, 21 | Java major version |
-| `ReportOnly` | switch | False | - | Check without making changes |
-| `RemoveOlder` | switch | False | - | Remove older versions in family |
-| `Cleanup` | switch | False | - | Clean stale env vars and PATH |
-| `Force` | switch | False | - | Force update even if current |
-| `UseMsiFallback` | switch | True | - | Fall back to MSI if winget unavailable |
-| `LogPath` | string | $env:ProgramData\JavaUpdate\JavaJRE-Update.log | - | Log file location |
-
-**Exit Codes**:
-- `0` - Up-to-date or no action required
-- `1` - Performed an update or install
-- `2` - ReportOnly mode: update would be required
-- `3` - Update required but cannot proceed (winget missing, MSI fallback disabled)
-
-**Example RMM Command**: `.\Java\Java-JRE-Update.ps1 -TargetFamily 17 -RemoveOlder -Cleanup`
-
----
-
-### Java-SDK-Update.ps1
-
-**Purpose**: Manages Java JDK (Temurin or Oracle) installations. Detects, reports, installs, or upgrades JDK for specified major versions with optional cleanup.
-
-**Execution Context**: Must run with Administrator privileges
-
-**Key Features**:
-- Same versioning engine as JRE script
-- Supports Java 8, 11, 17, 21
-- Auto-detection via winget
-- MSI fallback support (Temurin only)
-- Selective removal of older versions
-- Environment cleanup capabilities
-
-**RMM Component Variables**: Identical to Java-JRE-Update.ps1
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `Vendor` | string | Temurin | Java distribution |
-| `TargetFamily` | int | 21 | Java major version (8/11/17/21) |
-| `ReportOnly` | switch | False | Check without changes |
-| `RemoveOlder` | switch | False | Remove older versions in family |
-| `Cleanup` | switch | False | Clean stale env vars and PATH |
-| `Force` | switch | False | Force update when current |
-| `UseMsiFallback` | switch | True | Fall back to MSI without winget |
-| `LogPath` | string | $env:ProgramData\JavaUpdate\JavaJDK-Update.log | Log file location |
-
-**Exit Codes**: Same as Java-JRE-Update.ps1
-
-**Note**: Default TargetFamily is 21 (JDK) vs 17 (JRE)
-
----
-
-## Windows Update Scripts
-
-### Windows-Update-No-Auto-Reboot.ps1
-
-**Purpose**: Installs Windows updates with full user control. Never reboots automatically; user must explicitly click "Reboot now". Supports postponement, auto post-boot updates, and re-prompting if additional reboots needed.
-
-**Execution Context**: Can run as SYSTEM (creates tasks for user session interaction)
-
-**Key Features**:
-- User consent-only reboot strategy
-- Postpone options (30m, 1h, 2h configurable)
-- Post-boot worker auto-runs updates after user reboot
-- Re-prompting if another reboot becomes required
-- Interactive UI via scheduled task or fallback to msg.exe
-- Comprehensive reboot detection (registry, WMI, updates COM)
-
-**RMM Component Variables**:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `Mode` | string | Normal | Execution mode: Normal, PostBoot, PromptOnly |
-| `CountdownMinutes` | int | 10 | Reboot countdown duration |
-| `PostponeOptionsMinutes` | int[] | @(30, 60, 120) | Postpone duration options |
-| `PostponeOptionsCsv` | string | - | CSV override for postpone options |
-| `IncludeRebootUpdates` | switch | False | Include reboot-requiring updates |
-| `EnsureLatestCumulativeUpdate` | bool | True | Prioritize SSU/LCU updates |
-| `ReportOnly` | switch | False | Report without installing |
-| `PostRebootMaxPasses` | int | 4 | Post-boot update attempts |
-| `UiTitle` | string | "A security message from Nexus Open Systems Ltd" | Notification title |
-| `Reason` | string | (security message) | Notification message |
-| `BaseDir` | string | $env:ProgramData\NexusOpenSystems\WindowsUpdate | Working directory |
-| `LogPath` | string | .../WindowsUpdateReboot.log | Log file location |
-
-**Scheduled Tasks Created**:
-- `Nexus_WU_PostBootWorker` - Runs updates after user reboot
-- `Nexus_WU_RebootReminder` - Reminder timeout scheduler
-- `Nexus_WU_PromptOnLogon` - Show prompt at user logon
-- `Nexus_WU_PromptNow` - Show prompt immediately
-
-**Exit Codes**:
-- `0` - No reboot needed; updates installed or none available
-- `1` - Reboot required/pending; prompt launched or scheduled (no forced reboot)
-- `2` - Report-only OR updates found but none installed under rules
-- `3` - Error
-
-**Typical RMM Setup**: Schedule weekly or bi-weekly; use Mode=Normal for standard operation, Mode=PostBoot for automatic post-reboot updates
-
----
-
-### Recent Windows folder changes
-
-- Added `Windows-Update-No-Auto-Reboot-Ensure-LatestBuild.ps1`: a thin wrapper around `Windows-Update-No-Auto-Reboot.ps1` that enforces `EnsureLatestCumulativeUpdate` (SSU/LCU prioritization) while preserving the same header, parameters, logging, and exit-code patterns for RMM usage.
-- Standardized headers/parameters/logging across the Windows folder to match the `Windows-Update-No-Auto-Reboot.ps1` reference pattern. Files reviewed and confirmed or updated:
-  - `Windows-Update-No-Auto-Reboot.ps1` (reference, unchanged)
-  - `Windows-Update-Apply-Auto-Reboot.ps1` (follows reference pattern)
-  - `Windows-Update-No-Postpone.ps1` (follows reference pattern)
-  - `Windows-Update-No-Auto-Reboot-Ensure-LatestBuild.ps1` (new wrapper added)
-  - `winget-script.ps1` (package-management style; uses consistent Datto env helpers and logging)
-
-These changes ensure consistent RMM variable handling, `Write-Log` usage, and explicit exit-code documentation across Windows update scripts. If you want, I can further unify helper function names (e.g., exact `Write-Log` signature) across all files.
-
-
-### Windows-Update-Apply-Auto-Reboot.ps1
-
-**Purpose**: Installs all available Windows updates and automatically reboots if required (with countdown). No postpone option; reboot is mandatory after countdown expires.
-
-**Execution Context**: Can run as SYSTEM (InteractiveToken for user UI)
-
-**Key Features**:
-- Installs reboot-free updates immediately
-- Auto-reboot for required updates with countdown
-- User-friendly notification UI
-- Supports no-reboot updates and reboot-requiring updates
-- Session isolation (respects already-running-browsers rule)
-- Automatic cumulative update prioritization
-
-**RMM Component Variables**:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `CountdownMinutes` | int | 10 | Reboot countdown timer |
-| `IncludeRebootUpdates` | switch | False | Include reboot-requiring updates |
-| `EnsureLatestCumulativeUpdate` | bool | True | Prioritize SSU/LCU |
-| `ReportOnly` | switch | False | Report mode |
-| `UiTitle` | string | "A security message from Nexus Open Systems Ltd" | Notification title |
-| `Reason` | string | (security message) | Notification message |
-| `LogPath` | string | $env:ProgramData\NexusOpenSystems\WindowsUpdate\WindowsUpdateReboot.log | Log file location |
-
-**Exit Codes**:
-- `0` - No reboot needed; updates installed
-- `1` - Reboot prompt launched/scheduled
-- `2` - Updates found but none installed
-- `3` - Error
-
----
-
-### Windows-Update-No-Postpone.ps1
-
-**Purpose**: Installs Windows updates with countdown reboot UI but NO postpone option. "Restart now" or wait for countdown; reboot is inevitable.
-
-**Execution Context**: Can run as SYSTEM
-
-**Key Features**:
-- Forces reboot decision (now or countdown)
-- No postpone options available
-- Installs non-reboot updates first
-- Interactive countdown with restart button
-- Fallback to msg.exe + Windows shutdown countdown
-- All reboot precondition checking
-
-**RMM Component Variables**:
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `CountdownMinutes` | int | 10 | Reboot countdown duration |
-| `IncludeRebootUpdates` | switch | False | Include reboot-requiring updates |
-| `EnsureLatestCumulativeUpdate` | bool | True | Prioritize SSU/LCU |
-| `ReportOnly` | switch | False | Report mode |
-| `UiTitle` | string | "A security message from Nexus Open Systems Ltd" | Notification title |
-| `Reason` | string | (security message) | Notification message |
-| `LogPath` | string | $env:ProgramData\NexusOpenSystems\WindowsUpdate\WindowsUpdateReboot.log | Log file location |
-
-**Exit Codes**: Same as Windows-Update-Apply-Auto-Reboot.ps1
-
-**Typical RMM Setup**: Use in maintenance windows where immediate reboot is acceptable
-
----
-
-## ConnectSecure
-
-### ConnectSecure-Agent-Install.ps1
-
-**Purpose**: Installs or updates ConnectSecure (CyberCNS) security agent on Windows endpoints.
-
-**Execution Context**: Must run with Administrator privileges
-
-**Key Features**:
-- Checks for existing agent installation
-- Downloads latest agent from ConnectSecure API
-- Installs with provided credentials
-- Validates successful installation
-
-**Datto RMM Component Variables** (Required):
-
-Create these EXACT variable names in Datto component Variable editor:
-
-| Variable Name | Type | Example | Description |
-|---------------|------|---------|-------------|
-| `CompanyID` | String | ABC123 | Organization tenant ID |
-| `TenantID` | String | TID456 | Tenant identifier |
-| `Secret` | String | secret_key_value | Authentication secret |
-
-**Configuration**:
-- Agent Path Check: `C:\Program Files (x86)\CyberCNSAgent\cybercnsagent.exe`
-- API Endpoint: `https://configuration.myconnectsecure.com/api/v4/configuration/agentlink?ostype=windows`
-- Download Location: `%TEMP%\cybercnsagent.exe`
-- TLS Protocol: 1.2 (minimum)
-
-**Exit Codes**:
-- `0` - Agent already installed or installation succeeded
-- Non-zero - Installation failed (check downloaded log)
-
-**Typical RMM Setup**: Deploy once per endpoint or include in onboarding workflow
-
----
+# Windows Endpoint Scripts — concise reference
+
+Purpose: short guide to the repository's PowerShell remediation and detection scripts, designed for Datto RMM or similar endpoint managers.
+
+Author: Peter James — peter.james@nexusos.co.uk
+Version: v1.3
+
+Contents (major groups)
+- Browser
+- Java (JRE/JDK)
+- .NET runtime/SDK
+- Windows Update
+- ConnectSecure
+- Dell (DDPM)
+- Office
+- Python
+- VC++ redistributables
+- Zoom
+- winget helper
+- Security cleanup
+- Collection utilities
+
+Notes on style
+- Each script includes: purpose, recommended execution context (SYSTEM, Administrator, or user), key Datto RMM variables, and exit codes.
+
+One-line summaries
+- Browser: detection, notification, and remediation helpers for Chrome/Edge/Firefox. Detection runs as SYSTEM; user-facing reloads use InteractiveToken.
+- Java: `Java-JRE-Update.ps1` and `Java-SDK-Update.ps1` manage Temurin/Oracle JRE/JDK (8/11/17/21). Administrator; prefer `winget` with MSI fallback. Use `-ReportOnly` to test.
+- .NET: `Net-Runtime-Install-Latest-*NoRestart.ps1` enforces minimum versions, removes old ARP entries, and cleans folders. Administrator; use `-MinKeepVersion` and `-ReportOnly`.
+- Windows Update: three patterns — no-auto-reboot (user prompts), auto-reboot (maintenance windows), and no-postpone (forced reboot after countdown). SYSTEM or scheduled-task setups are typical.
+- ConnectSecure: `ConnectSecure-Agent-Install.ps1` and `ConnectSecure-Agent-Removal.ps1` install/remove the CyberCNS agent. Administrator; requires `CompanyID`, `TenantID`, `Secret` (install) and `cyberKey` (uninstall).
+- Dell (DDPM): `DDPM-Fix.ps1` detects/remediates vulnerable Dell DDPM installs. Run Detect first, then Remediate with installer URL and SHA256 when needed.
+- Office: `Office-Force-Update.ps1` triggers Click-to-Run updates. Can run as SYSTEM or user; `ForceCloseOfficeApps` is optional.
+- Python: `Python-Update.ps1` reports and may update Python installs; requires Administrator for installs and is marked for further integration.
+- VC++: `VC++-Install.ps1` enforces minimum redistributables per-architecture. Administrator; supports `-ReportOnly`.
+- Zoom: `Zoom-Cleanup.ps1` removes outdated Zoom clients while preserving a minimum version. Administrator; supports `-ReportOnly`.
+- winget: `winget-script.ps1` upgrades installed packages via Windows Package Manager. Supports `-ReportOnly` and optional winget auto-install.
+- Security cleanup: `Remove-Microsoft-Silverlight.ps1` removes Silverlight and optional SDKs. Administrator; supports `-AggressiveCleanup` and `-ReportOnly`.
+- Collection utilities: `Collect-Install-Logs.ps1` gathers MSI install/uninstall events for auditing and runs as non-admin (read-only event log access).
+
+How to use
+- Test first: run scripts with `-ReportOnly` where available.
+- Respect execution context: follow each script's header (SYSTEM vs Administrator vs user).
+- Logs: most scripts write to `%ProgramData%`; many expose a `LogPath` variable to override.
+
+Examples
+- Java update:
+
+  .\Java\Java-JRE-Update.ps1 -TargetFamily 17 -RemoveOlder -Cleanup
+
+- .NET report-only:
+
+  .\.Net\Net-Runtime-Install-Latest-Including-Host-Force-Removal-NoRestart.ps1 -MinKeepVersion "8.0.11" -ReportOnly
+
+Notes
+- Windows update scripts were standardized to share headers/parameters/logging and explicit exit-code documentation. Use the `No-Auto-Reboot` script for interactive, user-consent workflows and the `Apply-Auto-Reboot` / `No-Postpone` scripts for maintenance windows where a reboot is acceptable.
+
+If you'd like, I can:
+- Produce a single-line index file mapping each script to its path.
+- Expand any section into a short table of parameters and key exit codes.
+- Trim this further to only include specific categories (e.g., Browser + Windows Update).
 
 ### ConnectSecure-Agent-Removal.ps1
 
@@ -694,6 +372,48 @@ Install_Winget_if_Not_Avaialble = true  (auto-download winget if needed)
 - Author: Peter James
 - Version: 1.3
 - Designed for Datto RMM deployment
+
+---
+
+## Security Cleanup
+
+### Remove-Microsoft-Silverlight.ps1
+
+**Purpose**: Detects and removes Microsoft Silverlight from Windows endpoints, including optional Silverlight SDK components and residual folders or registry keys.
+
+**Execution Context**: Must run with Administrator privileges
+
+**Key Features**:
+- Uses Add/Remove Programs inventory instead of `Win32_Product`
+- Supports report-only inventory mode
+- Optionally closes browser and Silverlight-related processes before uninstall
+- Removes residual Silverlight folders and registry keys when enabled
+- Can broaden matching to any Silverlight publisher entry when required
+- Logs reboot-required uninstall results without forcing a restart
+
+**Datto RMM Component Variables**:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `ReportOnly` | switch | False | Inventory and log only |
+| `RemoveSDK` | switch | True | Remove Silverlight SDK/developer components as well |
+| `CloseProcesses` | switch | False | Close browsers and Silverlight-related processes before uninstall |
+| `AggressiveCleanup` | switch | True | Remove leftover folders and registry keys after uninstall |
+| `MatchAnyPublisher` | switch | False | Match any Silverlight ARP entry, not only Microsoft entries |
+| `FailIfRemaining` | switch | True | Exit 3 if Silverlight still appears after remediation |
+| `LogPath` | string | $env:ProgramData\NexusOpenSystems\Silverlight\Remove-Silverlight.log | Log file location |
+
+**Exit Codes**:
+- `0` - Success, no action required, report-only mode, or remediation completed
+- `3` - Error or Silverlight still present after remediation when `FailIfRemaining` is enabled
+
+**Example RMM Setup**:
+
+```powershell
+.\Remove-Microsoft-Silverlight.ps1 -CloseProcesses -AggressiveCleanup
+```
+
+**Typical Use Case**: Decommission Silverlight from managed endpoints as part of security hardening
 
 ---
 

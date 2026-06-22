@@ -1,22 +1,25 @@
 #Requires -Version 5.1
-<#
-Windows Update + Consent-only Reboot + Auto Post-boot Update + Post-install Prompt
 
+<#
 Author: Peter Opeyemi James
-Last Updated: 18-06-2026
 Company: Nexus Open Systems Ltd
+Date: 2026-05-05
+Email: Peter.James@nexusos.co.uk
+#>
+
+<#
+Windows Update + Consent-only Reboot + Auto Post-boot Update + Auto Re-prompt
 
 Behavior:
 - NEVER reboots automatically. Reboot only occurs when user clicks "Reboot now".
 - "Postpone" schedules a reminder that shows the same UI later (no reboot).
-- If a reboot is required, the UI is launched in the active logged-in user's session only after eligible pre-reboot updates have completed.
-- UI also appears at user logon ONLY if reboot is actually required.
+- UI appears at user logon ONLY if reboot is actually required.
 - Post-boot worker re-runs Windows Update automatically after a user-initiated reboot.
 - If another reboot becomes required after post-boot updates, the user is prompted again at logon.
 - Uses the same proven notification path as the working script:
   1) If already running as the interactive user, launch UI directly
-  2) If running as SYSTEM, launch the UI as the active logged-in user with WTSQueryUserToken + CreateProcessAsUser
-  3) Fallback to an interactive-users scheduled task
+  2) If running as SYSTEM, try CreateProcessAsUser into the active session
+  3) Fallback to schtasks /IT
   4) Final fallback is msg.exe only (never reboots)
 
 Reboot detection:
@@ -48,7 +51,7 @@ param(
   [int]$PostRebootMaxPasses = 4,
 
   [switch]$VerboseLogging,
-  [int]$UiLaunchConfirmSeconds = 30,
+  [int]$UiLaunchConfirmSeconds = 8,
 
   [string]$UiTitle = "A security message from Nexus Open Systems Ltd",
   [string]$Reason  = "Windows updates require a restart to finish installing. Please plug your computer into power if it's not already, save your work, and restart as soon as possible to ensure your system is secure and up to date.",
@@ -412,8 +415,8 @@ function Get-UiSignal {
 
 function Wait-ForUiSignal {
   param(
-    [string[]]$Stages = @('SHOWN'),
-    [int]$TimeoutSeconds = 30
+    [string[]]$Stages = @('START','SHOWN'),
+    [int]$TimeoutSeconds = 8
   )
 
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -439,13 +442,18 @@ using System.Runtime.InteropServices;
 
 public static class NexusSessionLauncher
 {
+  private const uint TOKEN_ASSIGN_PRIMARY = 0x0001;
+  private const uint TOKEN_DUPLICATE = 0x0002;
+  private const uint TOKEN_QUERY = 0x0008;
+  private const uint TOKEN_ADJUST_DEFAULT = 0x0080;
+  private const uint TOKEN_ADJUST_SESSIONID = 0x0100;
   private const uint MAXIMUM_ALLOWED = 0x02000000;
+
   private const int SecurityImpersonation = 2;
   private const int TokenPrimary = 1;
+  private const int TokenSessionId = 12;
 
   private const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
-  private const int STARTF_USESHOWWINDOW = 0x00000001;
-  private const short SW_SHOWNORMAL = 1;
 
   private enum WTS_CONNECTSTATE_CLASS
   {
@@ -494,6 +502,12 @@ public static class NexusSessionLauncher
     public int dwThreadId;
   }
 
+  [DllImport("kernel32.dll")]
+  private static extern IntPtr GetCurrentProcess();
+
+  [DllImport("advapi32.dll", SetLastError=true)]
+  private static extern bool OpenProcessToken(IntPtr ProcessHandle, uint DesiredAccess, out IntPtr TokenHandle);
+
   [DllImport("advapi32.dll", SetLastError=true)]
   private static extern bool DuplicateTokenEx(
     IntPtr hExistingToken,
@@ -502,6 +516,9 @@ public static class NexusSessionLauncher
     int ImpersonationLevel,
     int TokenType,
     out IntPtr phNewToken);
+
+  [DllImport("advapi32.dll", SetLastError=true)]
+  private static extern bool SetTokenInformation(IntPtr TokenHandle, int TokenInformationClass, ref int TokenInformation, int TokenInformationLength);
 
   [DllImport("userenv.dll", SetLastError=true)]
   private static extern bool CreateEnvironmentBlock(out IntPtr lpEnvironment, IntPtr hToken, bool bInherit);
@@ -532,78 +549,75 @@ public static class NexusSessionLauncher
   [DllImport("Wtsapi32.dll")]
   private static extern void WTSFreeMemory(IntPtr pMemory);
 
-  [DllImport("Wtsapi32.dll", SetLastError=true)]
-  private static extern bool WTSQueryUserToken(UInt32 sessionId, out IntPtr Token);
-
   private static int GetActiveSessionId()
   {
-    IntPtr pInfo = IntPtr.Zero;
-    int count = 0;
+    IntPtr pInfo;
+    int count;
     if (WTSEnumerateSessions(IntPtr.Zero, 0, 1, out pInfo, out count))
     {
-      try
+      int dataSize = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
+      long current = (long)pInfo;
+      for (int i=0; i<count; i++)
       {
-        int dataSize = Marshal.SizeOf(typeof(WTS_SESSION_INFO));
-        long current = (long)pInfo;
-        for (int i=0; i<count; i++)
+        WTS_SESSION_INFO si = (WTS_SESSION_INFO)Marshal.PtrToStructure(new IntPtr(current), typeof(WTS_SESSION_INFO));
+        if (si.State == WTS_CONNECTSTATE_CLASS.WTSActive)
         {
-          WTS_SESSION_INFO si = (WTS_SESSION_INFO)Marshal.PtrToStructure(new IntPtr(current), typeof(WTS_SESSION_INFO));
-          if (si.State == WTS_CONNECTSTATE_CLASS.WTSActive)
-          {
-            return si.SessionID;
-          }
-          current += dataSize;
+          WTSFreeMemory(pInfo);
+          return si.SessionID;
         }
+        current += dataSize;
       }
-      finally
-      {
-        WTSFreeMemory(pInfo);
-      }
+      WTSFreeMemory(pInfo);
     }
     return -1;
   }
 
-  public static bool StartAsActiveUserInActiveSession(string appPath, string fullCmdLine, out int lastError, out int processId, out int sessionId)
+  public static bool StartAsSystemInActiveSession(string appPath, string fullCmdLine, out int lastError)
   {
     lastError = 0;
-    processId = 0;
-    sessionId = GetActiveSessionId();
-
+    int sessionId = GetActiveSessionId();
     if (sessionId < 0)
     {
       lastError = 0x57;
       return false;
     }
 
-    IntPtr hUserToken = IntPtr.Zero;
-    if (!WTSQueryUserToken((UInt32)sessionId, out hUserToken))
+    IntPtr hToken;
+    if (!OpenProcessToken(GetCurrentProcess(),
+      TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ADJUST_DEFAULT | TOKEN_ADJUST_SESSIONID,
+      out hToken))
     {
       lastError = Marshal.GetLastWin32Error();
       return false;
     }
 
-    IntPtr hPrimaryToken = IntPtr.Zero;
-    bool ok = DuplicateTokenEx(hUserToken, MAXIMUM_ALLOWED, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hPrimaryToken);
-    CloseHandle(hUserToken);
-
+    IntPtr hDup;
+    bool ok = DuplicateTokenEx(hToken, MAXIMUM_ALLOWED, IntPtr.Zero, SecurityImpersonation, TokenPrimary, out hDup);
+    CloseHandle(hToken);
     if (!ok)
     {
       lastError = Marshal.GetLastWin32Error();
       return false;
     }
 
+    ok = SetTokenInformation(hDup, TokenSessionId, ref sessionId, sizeof(int));
+    if (!ok)
+    {
+      lastError = Marshal.GetLastWin32Error();
+      CloseHandle(hDup);
+      return false;
+    }
+
     IntPtr env = IntPtr.Zero;
-    CreateEnvironmentBlock(out env, hPrimaryToken, false);
+    CreateEnvironmentBlock(out env, hDup, false);
 
     STARTUPINFO si = new STARTUPINFO();
     si.cb = Marshal.SizeOf(si);
     si.lpDesktop = "winsta0\\default";
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOWNORMAL;
 
     PROCESS_INFORMATION pi;
     ok = CreateProcessAsUser(
-      hPrimaryToken,
+      hDup,
       appPath,
       fullCmdLine,
       IntPtr.Zero, IntPtr.Zero,
@@ -616,7 +630,7 @@ public static class NexusSessionLauncher
     );
 
     if (env != IntPtr.Zero) DestroyEnvironmentBlock(env);
-    CloseHandle(hPrimaryToken);
+    CloseHandle(hDup);
 
     if (!ok)
     {
@@ -624,7 +638,6 @@ public static class NexusSessionLauncher
       return false;
     }
 
-    processId = pi.dwProcessId;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return true;
@@ -860,8 +873,6 @@ try {
   `$form.Size = New-Object System.Drawing.Size(780, 340)
   `$form.StartPosition = 'CenterScreen'
   `$form.TopMost = `$true
-  `$form.ShowInTaskbar = `$true
-  `$form.WindowState = 'Normal'
   `$form.MaximizeBox = `$false
   `$form.MinimizeBox = `$false
   `$form.FormBorderStyle = 'FixedDialog'
@@ -871,13 +882,6 @@ try {
     }
   })
   `$form.Add_Shown({
-    try {
-      `$form.WindowState = 'Normal'
-      `$form.TopMost = `$true
-      `$form.Activate()
-      `$form.BringToFront()
-      [System.Media.SystemSounds]::Exclamation.Play()
-    } catch { }
     Write-LogLocal "UI_SHOWN"
     Set-UiSignal 'SHOWN'
   })
@@ -998,47 +1002,6 @@ function Write-UiWrapperFile {
   Write-Log ("Wrote UI wrapper file to '{0}'." -f $UiWrapperPath) 'DEBUG'
 }
 
-function Register-ImmediateInteractiveUsersTaskAndRun {
-  try {
-    Import-Module ScheduledTasks -ErrorAction Stop
-
-    $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $arg = ('-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -CountdownMinutes {1}' -f `
-      $UiHelperPath, $CountdownMinutes)
-
-    Remove-Task $TaskImmediate
-    Clear-UiSignal
-
-    $action = New-ScheduledTaskAction -Execute $psExe -Argument $arg
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1)
-    $principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-    Register-ScheduledTask -TaskName $TaskImmediate -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Log "Immediate interactive-users fallback task registered."
-
-    Start-ScheduledTask -TaskName $TaskImmediate -ErrorAction Stop
-    Write-Log "Immediate interactive-users fallback task started."
-
-    $sig = Wait-ForUiSignal -Stages @('SHOWN') -TimeoutSeconds $UiLaunchConfirmSeconds
-    if ($sig) {
-      Write-Log ("UI shown after interactive-users scheduled-task fallback: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
-      return $true
-    }
-
-    $last = Get-UiSignal
-    if ($last) {
-      Write-Log ("Interactive-users fallback task ran but UI did not report SHOWN. LastStage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $last.Stage, $last.SessionId, $last.PID, $last.Identity) 'WARN'
-    } else {
-      Write-Log "Interactive-users fallback task ran but no UI signal was written." 'WARN'
-    }
-  } catch {
-    Write-ExceptionLog -Prefix 'Immediate interactive-users scheduled-task fallback failed' -ErrorRecord $_
-  }
-
-  return $false
-}
-
 function Launch-UiInActiveSessionNow {
   if (-not (Test-PendingReboot)) {
     Write-Log "Immediate UI not launched: reboot not required."
@@ -1055,24 +1018,18 @@ function Launch-UiInActiveSessionNow {
   $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
   $cmdLine = Get-UiCommandLine
 
-  Write-Log ("UI launch attempt: ParentIdentity='{0}'; RequestedContext='active logged-in user'; ConfirmStage='SHOWN'" -f $currentIdentity)
+  Write-Log ("UI launch attempt: Identity='{0}'" -f $currentIdentity)
   Clear-UiSignal
 
   if (-not $isSystem) {
     try {
-      Start-Process -FilePath $psExe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File `"$UiHelperPath`" -CountdownMinutes $CountdownMinutes" -WindowStyle Hidden
-      $sig = Wait-ForUiSignal -Stages @('SHOWN') -TimeoutSeconds $UiLaunchConfirmSeconds
+      Start-Process -FilePath $psExe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -STA -File `"$UiHelperPath`" -CountdownMinutes $CountdownMinutes" -WindowStyle Hidden
+      $sig = Wait-ForUiSignal -TimeoutSeconds $UiLaunchConfirmSeconds
       if ($sig) {
-        Write-Log ("UI shown from direct user-context launch: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
+        Write-Log ("UI helper confirmed: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
         return
       }
-
-      $last = Get-UiSignal
-      if ($last) {
-        Write-Log ("Direct user-context launch did not report SHOWN. LastStage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $last.Stage, $last.SessionId, $last.PID, $last.Identity) 'WARN'
-      } else {
-        Write-Log "Direct user-context launch did not write any UI signal." 'WARN'
-      }
+      Write-Log "Direct user-context launch did not confirm UI startup." 'WARN'
     } catch {
       Write-ExceptionLog -Prefix 'Immediate UI direct launch failed' -ErrorRecord $_
     }
@@ -1081,32 +1038,52 @@ function Launch-UiInActiveSessionNow {
   if ($isSystem -and (Ensure-SystemSessionLauncher)) {
     try {
       $err = 0
-      $launchedPid = 0
-      $sessionId = 0
-      $ok = [NexusSessionLauncher]::StartAsActiveUserInActiveSession($psExe, $cmdLine, [ref]$err, [ref]$launchedPid, [ref]$sessionId)
+      $ok = [NexusSessionLauncher]::StartAsSystemInActiveSession($psExe, $cmdLine, [ref]$err)
       if ($ok) {
-        Write-Log ("Active-user launcher started UI helper. ActiveSessionId='{0}' PID='{1}'" -f $sessionId, $launchedPid)
-        $sig = Wait-ForUiSignal -Stages @('SHOWN') -TimeoutSeconds $UiLaunchConfirmSeconds
+        $sig = Wait-ForUiSignal -TimeoutSeconds $UiLaunchConfirmSeconds
         if ($sig) {
-          Write-Log ("UI shown for active logged-in user: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
+          Write-Log ("UI helper confirmed after SessionLauncher: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
           return
         }
-
-        $last = Get-UiSignal
-        if ($last) {
-          Write-Log ("Active-user launcher started the helper but it did not report SHOWN. LastStage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $last.Stage, $last.SessionId, $last.PID, $last.Identity) 'WARN'
-        } else {
-          Write-Log "Active-user launcher started the helper but no UI signal was written." 'WARN'
-        }
+        Write-Log "SessionLauncher returned success, but UI helper did not confirm startup." 'WARN'
       } else {
-        Write-Log ("Active-user launcher failed. Win32Error={0}" -f $err) 'WARN'
+        Write-Log ("SessionLauncher failed. Win32Error={0}" -f $err) 'WARN'
       }
     } catch {
-      Write-ExceptionLog -Prefix 'Immediate UI active-user launcher failed' -ErrorRecord $_
+      Write-ExceptionLog -Prefix 'Immediate UI SessionLauncher failed' -ErrorRecord $_
     }
   }
 
-  if (Register-ImmediateInteractiveUsersTaskAndRun) { return }
+  try {
+    Write-UiWrapperFile
+    $start = (Get-Date).AddMinutes(3)
+    $sd = $start.ToString('MM/dd/yyyy')
+    $st = $start.ToString('HH:mm')
+
+    Remove-Task $TaskImmediate
+    if ($isSystem) {
+      $createOut = & schtasks.exe /Create /TN $TaskImmediate /TR "`"$UiWrapperPath`"" /SC ONCE /SD $sd /ST $st /RU SYSTEM /RL HIGHEST /IT /F 2>&1
+    } else {
+      $createOut = & schtasks.exe /Create /TN $TaskImmediate /TR "`"$UiWrapperPath`"" /SC ONCE /SD $sd /ST $st /RU $currentIdentity /RL LIMITED /IT /F 2>&1
+    }
+    Write-Log ("Immediate fallback task create: {0}" -f (($createOut | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
+
+    if ($LASTEXITCODE -eq 0) {
+      $runOut = & schtasks.exe /Run /TN $TaskImmediate 2>&1
+      Write-Log ("Immediate fallback task run: {0}" -f (($runOut | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
+
+      if ($LASTEXITCODE -eq 0) {
+        $sig = Wait-ForUiSignal -TimeoutSeconds $UiLaunchConfirmSeconds
+        if ($sig) {
+          Write-Log ("UI helper confirmed after scheduled-task fallback: Stage='{0}' SessionId='{1}' PID='{2}' Identity='{3}'" -f $sig.Stage, $sig.SessionId, $sig.PID, $sig.Identity)
+          return
+        }
+        Write-Log "Scheduled-task fallback ran, but UI helper did not confirm startup." 'WARN'
+      }
+    }
+  } catch {
+    Write-ExceptionLog -Prefix 'Immediate UI schtasks fallback failed' -ErrorRecord $_
+  }
 
   Send-UserMessage "Windows updates require a restart. Please save your work and reboot when ready."
   Write-Log "Final fallback used msg.exe only (no reboot)." 'WARN'
@@ -1116,52 +1093,27 @@ function Register-LogonPromptTask {
   Remove-Task $TaskOnLogon
   Write-UiWrapperFile
 
-  try {
-    Import-Module ScheduledTasks -ErrorAction Stop
-
-    $psExe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-    $arg = ('-NoProfile -ExecutionPolicy Bypass -STA -WindowStyle Hidden -File "{0}" -CountdownMinutes {1}' -f `
-      $UiHelperPath, $CountdownMinutes)
-
-    $action = New-ScheduledTaskAction -Execute $psExe -Argument $arg
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
-    $principal = New-ScheduledTaskPrincipal -GroupId 'BUILTIN\Users' -RunLevel Limited
-    $settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-
-    Register-ScheduledTask -TaskName $TaskOnLogon -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Log "Registered ONLOGON prompt task for logged-in users."
-    Write-TaskDiagnostics -TaskName $TaskOnLogon -Prefix 'ONLOGON_TASK'
-    return
-  } catch {
-    Write-ExceptionLog -Prefix 'ONLOGON logged-in-user task registration failed' -ErrorRecord $_
-  }
-
   $currentIdentity = Get-CurrentIdentityName
   $isSystem = $currentIdentity -eq 'NT AUTHORITY\SYSTEM'
 
-  try {
-    if ($isSystem) {
-      $out = & schtasks.exe /Create /TN $TaskOnLogon /SC ONLOGON /RU SYSTEM /RL HIGHEST /IT /TR "`"$UiWrapperPath`"" /F 2>&1
-      Write-Log ("ONLOGON schtasks /Create output: {0}" -f (($out | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
-      if ($LASTEXITCODE -ne 0) {
-        throw ("Failed to create ONLOGON prompt task as SYSTEM: {0}" -f ($out -join ' '))
-      }
-      Write-Log "Registered ONLOGON prompt task as SYSTEM (/IT) fallback."
+  if ($isSystem) {
+    $out = & schtasks.exe /Create /TN $TaskOnLogon /SC ONLOGON /RU SYSTEM /RL HIGHEST /IT /TR "`"$UiWrapperPath`"" /F 2>&1
+    Write-Log ("ONLOGON schtasks /Create output: {0}" -f (($out | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
+    if ($LASTEXITCODE -ne 0) {
+      throw ("Failed to create ONLOGON prompt task as SYSTEM: {0}" -f ($out -join ' '))
     }
-    else {
-      $out = & schtasks.exe /Create /TN $TaskOnLogon /SC ONLOGON /RU $currentIdentity /RL LIMITED /IT /TR "`"$UiWrapperPath`"" /F 2>&1
-      Write-Log ("ONLOGON schtasks /Create output: {0}" -f (($out | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
-      if ($LASTEXITCODE -ne 0) {
-        throw ("Failed to create ONLOGON prompt task as current user: {0}" -f ($out -join ' '))
-      }
-      Write-Log ("Registered ONLOGON prompt task as current user '{0}' fallback." -f $currentIdentity)
-    }
-
-    Write-TaskDiagnostics -TaskName $TaskOnLogon -Prefix 'ONLOGON_TASK'
-  } catch {
-    Write-ExceptionLog -Prefix 'ONLOGON fallback task registration failed' -ErrorRecord $_
-    throw
+    Write-Log "Registered ONLOGON prompt task as SYSTEM (/IT)."
   }
+  else {
+    $out = & schtasks.exe /Create /TN $TaskOnLogon /SC ONLOGON /RU $currentIdentity /RL LIMITED /IT /TR "`"$UiWrapperPath`"" /F 2>&1
+    Write-Log ("ONLOGON schtasks /Create output: {0}" -f (($out | ForEach-Object { $_.ToString().Trim() }) -join ' | ')) 'DEBUG'
+    if ($LASTEXITCODE -ne 0) {
+      throw ("Failed to create ONLOGON prompt task as current user: {0}" -f ($out -join ' '))
+    }
+    Write-Log ("Registered ONLOGON prompt task as current user '{0}'." -f $currentIdentity)
+  }
+
+  Write-TaskDiagnostics -TaskName $TaskOnLogon -Prefix 'ONLOGON_TASK'
 }
 
 function Get-AvailableUpdates {
@@ -1410,9 +1362,9 @@ function Run-PostBootWorker {
 try {
   Ensure-BaseDirPermissions
 
-  Write-Host "Windows Update (Consent-only + auto re-run + verified active-user UI launch; prompt after eligible updates complete)"
-  Write-Log ("Script start: Mode='{0}'; Identity='{1}'; Computer='{2}'; PSVersion='{3}'; IncludeRebootUpdates='{4}'; EnsureLatestCumulativeUpdate='{5}'; ReportOnly='{6}'; CountdownMinutes='{7}'; VerboseLogging='{8}'; UiLaunchConfirmSeconds='{9}'" -f `
-    $Mode, (Get-CurrentIdentityName), $env:COMPUTERNAME, $PSVersionTable.PSVersion, [bool]$IncludeRebootUpdates, $EnsureLatestCumulativeUpdate, [bool]$ReportOnly, $CountdownMinutes, [bool]$VerboseLogging, $UiLaunchConfirmSeconds)
+  Write-Host "Windows Update (Consent-only + auto re-run + verified UI launch; prompt only if reboot required)"
+  Write-Log ("Script start: Mode='{0}'; Identity='{1}'; Computer='{2}'; PSVersion='{3}'; IncludeRebootUpdates='{4}'; EnsureLatestCumulativeUpdate='{5}'; ReportOnly='{6}'; CountdownMinutes='{7}'; VerboseLogging='{8}'" -f `
+    $Mode, (Get-CurrentIdentityName), $env:COMPUTERNAME, $PSVersionTable.PSVersion, [bool]$IncludeRebootUpdates, $EnsureLatestCumulativeUpdate, [bool]$ReportOnly, $CountdownMinutes, [bool]$VerboseLogging)
 
   $os = Get-OsBuildInfo
   if ($os) { Write-Log ("OS_BUILD_INFO: {0}" -f $os) }
@@ -1481,12 +1433,12 @@ try {
 
   Register-LogonPromptTask
 
-  Write-Log "Pre-reboot phase: checking pending reboot state before scanning/installing updates..."
+  Write-Log "Pre-reboot phase: scanning/installing updates..."
   Write-PendingRebootLog -Prefix 'PREBOOT_PENDING_STATE_BEFORE'
   $beforePending = Test-PendingReboot
 
   if ($beforePending) {
-    Write-Log "System indicates a Windows Update / servicing pending reboot. Continuing to install eligible non-reboot updates before prompting the user."
+    Write-Log "System indicates a Windows Update / servicing pending reboot."
   } else {
     $conservativeBefore = Test-PendingReboot -Conservative
     if ($conservativeBefore) {
