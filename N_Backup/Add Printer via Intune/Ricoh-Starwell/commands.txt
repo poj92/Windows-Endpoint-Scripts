@@ -1,0 +1,6 @@
+powershell.exe -executionpolicy bypass -file Install-Stairwell-Printer.ps1
+powershell.exe -executionpolicy bypass -file Remove-Stairwell-Printer.ps1
+
+Detection:
+Reg Key:
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\Ricoh Stairwell Printer

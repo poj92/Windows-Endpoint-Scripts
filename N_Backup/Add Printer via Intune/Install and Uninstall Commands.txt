@@ -1,0 +1,35 @@
+powershell.exe -executionpolicy bypass -file Install-Printer.ps1 -PortName "IP_10.107.0.5" -PrinterIP "10.107.0.5" -PrinterName "Xerox Altalink" -DriverName "Xerox Global Print Driver PCL6" -INFFile "x3UNIVX.inf"
+
+
+powershell.exe -executionpolicy bypass -file Remove-Printer.ps1 -PrinterName "Xerox Altalink"
+
+
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\Xerox Altalink
+----------------------------------------------------------------------------
+
+
+
+powershell.exe -executionpolicy bypass -file Install-Printer.ps1 -PortName "IP_10.2.0.18" -PrinterIP "10.2.0.18" -PrinterName "Ricoh Stairwell Printer" -DriverName "PCL6 Driver for Universal Print" -INFFile "oemsetup.inf"
+
+
+
+powershell.exe -executionpolicy bypass -file Remove-Printer.ps1 -PrinterName "Ricoh Stairwell Printer"
+
+
+
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\Ricoh Stairwell Printer
+
+-----------------------------------------------------------------------------------------
+
+
+powershell.exe -executionpolicy bypass -file Install-Printer.ps1 -PortName "IP_10.2.0.20" -PrinterIP "10.2.0.20" -PrinterName "Ricoh Office Printer" -DriverName "PCL6 Driver for Universal Print" -INFFile "oemsetup.inf"
+
+
+
+powershell.exe -executionpolicy bypass -file Remove-Printer.ps1 -PrinterName "Ricoh Office Printer"
+
+
+
+HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print\Printers\Ricoh Office Printer
+
+

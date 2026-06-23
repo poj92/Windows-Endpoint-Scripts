@@ -1,0 +1,1 @@
+New-DynamicDistributionGroup -Name "Kingston Team (South)" -DisplayName "Kingston Team (South)" -RecipientFilter "(RecipientTypeDetails -eq 'UserMailbox') -and (City -eq 'Kingston upon Thames')" -PrimarySmtpAddress "Kingston.south@cardogroup.co.uk"

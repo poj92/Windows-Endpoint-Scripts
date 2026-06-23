@@ -1,0 +1,61 @@
+#Requires -Modules ActiveDirectory, ExchangeOnlineManagement
+
+# --- Configurations ---
+$UserPrincipalName = "user.name@domain.com" # The user's UPN to convert
+$NewOUPath = "OU=NewOU,DC=domain,DC=com" # The path to the new OU
+# --- End Configurations ---
+
+# --- Connect to Exchange Online ---
+try {
+    if (-not (Get-Module -Name ExchangeOnlineManagement -ListAvailable)) {
+        Install-Module -Name ExchangeOnlineManagement -Force
+    }
+    Connect-ExchangeOnline -UserPrincipalName $UserPrincipalName
+}
+catch {
+    Write-Error "Failed to connect to Exchange Online: $($_.Exception.Message)"
+    exit
+}
+
+# --- Convert Mailbox to Shared Mailbox ---
+try {
+    Set-Mailbox -Identity $UserPrincipalName -Type Shared
+    Write-Host "Successfully converted $UserPrincipalName to a shared mailbox."
+}
+catch {
+    Write-Error "Failed to convert mailbox to shared: $($_.Exception.Message)"
+    exit
+}
+
+# --- Block Sign-in ---
+try {
+    Set-Mailbox -Identity $UserPrincipalName -BlockCredential $true
+    Write-Host "Successfully blocked sign-in for $UserPrincipalName."
+}
+catch {
+    Write-Error "Failed to block sign-in: $($_.Exception.Message)"
+    exit
+}
+
+# --- Move Account to New OU ---
+try {
+    $User = Get-ADUser -Identity $UserPrincipalName -Properties objectClass
+    if ($User) {
+        if ($User.ObjectClass -eq "user") {
+             Move-ADObject -Identity $User.DistinguishedName -TargetPath $NewOUPath
+             Write-Host "Successfully moved $UserPrincipalName to $NewOUPath."
+        } else {
+           Write-Host "The object is not a user. Object class: $($User.ObjectClass)"
+        }
+    } else {
+        Write-Error "User not found in Active Directory."
+        exit
+    }
+
+}
+catch {
+    Write-Error "Failed to move user to new OU: $($_.Exception.Message)"
+    exit
+}
+
+Write-Host "Process completed."
